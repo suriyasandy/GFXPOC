@@ -73,10 +73,51 @@ df_summary = compute_thresholds_per_currency(df)
 
 # UI layout
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Overview", "Thresholds", "Cross Simulation", "Smile Threshold", "Smile Visuals", "Recalibration Simulation"])
-
 with tab1:
-    st.title("FX Volatility Thresholding: Manual vs Model")
-    st.markdown("Compare fixed manual groupings with dynamic methods like GARCH, EVT, and smile-adjusted logic.")
+    st.title("FX Volatility Thresholding: Manual vs Dynamic")
+
+    st.subheader("📌 Business Use Case")
+    st.markdown("""
+    In institutional FX markets, trades are monitored for **rate deviations** from market benchmarks.
+    A key component of this is **volatility thresholding**, which helps:
+    - Flag trades with excessive deviation.
+    - Ensure fairness, reduce risk, and maintain compliance.
+
+    Currently, operations teams use **static thresholds** per currency, based on manual grouping logic.
+    But these thresholds:
+    - Don’t adapt to changing market conditions.
+    - Fail to account for structural behaviors like **volatility clustering** or **option smiles**.
+    """)
+
+    st.subheader("📉 Manual Approach (Baseline)")
+    st.markdown("""
+    - Currencies are bucketed into 4 fixed groups (based on average volatility ranges).
+    - Each group has a fixed threshold (e.g., 0.10, 0.25...).
+    - These thresholds are static and reviewed annually or post-incident.
+
+    **Limitations**:
+    - Outdated during regime shifts.
+    - Not tailored to individual currency behavior.
+    - No support for cross-currency or structural features like skew or RR/BF.
+    """)
+
+    st.subheader("🚀 Our Dynamic Approach")
+    st.markdown("""
+    We simulate and compare **multiple thresholding methods**:
+    - 📈 GARCH: Captures volatility clustering.
+    - 🔺 EVT: Captures extreme tail risks.
+    - 🧠 Smile-based logic: Uses implied volatility structure (ATM, Risk Reversal, Butterfly).
+    - 📊 Rolling statistics & 95th percentile comparisons.
+    - 🔁 Cross-pair thresholding and real-time recalibration simulations.
+
+    All results are:
+    - Transparent & visual.
+    - Easy to interpret.
+    - Designed for **weekly recalibration** instead of static thresholds.
+    """)
+
+    st.success("Use the tabs above to compare manual thresholds with smarter, data-driven models!")
+
 
 with tab2:
     st.header("Threshold Comparison")
@@ -136,16 +177,58 @@ with tab3:
     st.plotly_chart(fig, use_container_width=True)
 
 with tab4:
-    st.header("Smile-Justified Simulation (Auto)")
-    sel = st.selectbox("Select Currency", df_summary["Currency"], key="tab4_currency")
-    row = df_summary[df_summary["Currency"] == sel].iloc[0]
+    tab4_sub1, tab4_sub2 = st.tabs(["Smile Threshold", "What is Smile?"])
 
-    st.write(f"ATM: {row['ATM']:.4f}, RR: {row['RR']:.4f}, BF: {row['BF']:.4f}")
-    alpha = st.slider("Alpha (RR weight)", 0.0, 3.0, 1.0)
-    beta = st.slider("Beta (BF weight)", 0.0, 3.0, 1.0)
+    with tab4_sub1:
+        st.header("Smile-Justified Simulation (Auto)")
+        sel = st.selectbox("Select Currency", df_summary["Currency"], key="tab4_currency")
+        row = df_summary[df_summary["Currency"] == sel].iloc[0]
 
-    smile_thresh = row["ATM"] + alpha * row["RR"] + beta * row["BF"]
-    st.metric("Smile-Adjusted Threshold", f"{smile_thresh:.4f}")
+        st.write(f"ATM: {row['ATM']:.4f}, RR: {row['RR']:.4f}, BF: {row['BF']:.4f}")
+        alpha = st.slider("Alpha (RR weight)", 0.0, 3.0, 1.0)
+        beta = st.slider("Beta (BF weight)", 0.0, 3.0, 1.0)
+
+        smile_thresh = row["ATM"] + alpha * row["RR"] + beta * row["BF"]
+        st.metric("Smile-Adjusted Threshold", f"{smile_thresh:.4f}")
+
+    with tab4_sub2:
+        st.header("What is a Volatility Smile?")
+
+        st.markdown("""
+        ####  Simple Explanation:
+        Markets expect **extreme price moves** (both up and down) to happen more often than average models assume.
+
+        This leads to **higher implied volatility** for far out-of-the-money options — forming a curve that looks like a **smile**.
+        
+        ---
+        ####  Smile Components:
+        | Component | What it Means |
+        |-----------|----------------|
+        | **ATM Vol** | Market volatility when expecting no big move
+        | **RR** (Risk Reversal) | Market fear of big up vs. big down moves
+        | **BF** (Butterfly) | Market belief in extreme movements 
+
+        ---
+        ####  Why it Matters:
+        - Manual thresholds don't reflect market mood.
+        - Smile-based thresholds adapt to real risk pricing.
+        - Especially important during global events or shocks.
+
+        ---
+        #### ✅ Example:
+        If ATM = 0.20, RR = 0.03, BF = 0.02:
+
+        `Smile Threshold = ATM + 1×RR + 1×BF = 0.25`
+
+        If RR or BF changes (say market panics), the threshold also adapts!
+        """)
+
+        st.subheader("Example Visualization")
+        ex_df = df_summary[df_summary["Currency"].isin(["INR", "JPY", "GBP"])]
+        fig = px.bar(ex_df, x="Currency", y=["ManualThreshold", "Smile_Threshold"],
+                     barmode="group", title="Manual vs Smile Threshold for Key Currencies")
+        st.plotly_chart(fig, use_container_width=True)
+
 
 with tab5:
     st.header("Smile Components Visualization")
