@@ -197,35 +197,69 @@ with tab4:
     flagged_df = predict_and_explain(df, model, scaler)
     st.dataframe(flagged_df[["Currency", "Date", "Volatility", "RSI", "MACD", "BBWidth", "VolFlag_RF"]].tail(10))
 
+# --- Part 5: Streamlit UI Assembly (Updated with SHAP fix) ---
+
+df = load_fx_data()
+st.set_page_config(layout="wide")
+st.title("FX Volatility Thresholding: Hybrid ML + Statistical App")
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "Overview",
+    "Per-Currency Thresholds",
+    "Cross-Currency Shock Simulation",
+    "ML Flags + SHAP",
+    "Explainability"
+])
+
+# --- Tab 1: Overview ---
+with tab1:
+    st.header("Business Rationale")
+    st.markdown("""
+    - Manual thresholds are rigid and miss key spikes.
+    - We replace them with dynamic, explainable thresholds:
+      - 95th percentile (statistical)
+      - EVT (tail-fit)
+      - GARCH (forecast)
+      - Random Forest with SHAP explanations
+    """)
+
+# --- Tab 2: Thresholds ---
+with tab2:
+    st.header("Per-Currency Threshold View")
+    df_summary = compute_thresholds_per_currency(df)
+    st.dataframe(df_summary.style.format("{:.4f}"))
+
+# --- Tab 3: Cross-Currency Simulation ---
+with tab3:
+    st.header("Cross-Currency Threshold Simulation")
+    currencies = df["Currency"].unique().tolist()
+    base = st.selectbox("Base Currency", currencies, key="base")
+    quote = st.selectbox("Quote Currency", currencies, key="quote")
+
+    base_vol = get_latest_vol(df, base)
+    quote_vol = get_latest_vol(df, quote)
+    st.metric(f"{base} Vol", f"{base_vol:.4f}")
+    st.metric(f"{quote} Vol", f"{quote_vol:.4f}")
+
+    table = generate_shock_table(base_vol, quote_vol)
+    st.dataframe(table.style.format("{:.4f}"))
+
+# --- Tab 4: ML Flags ---
+with tab4:
+    st.header("ML-Based Flagging")
+    model, scaler, X_test, X_test_scaled, y_test = train_rf_model(df)
+    flagged_df = predict_and_explain(df, model, scaler)
+    st.dataframe(flagged_df[["Currency", "Date", "Volatility", "RSI", "MACD", "BBWidth", "VolFlag_RF"]].tail(10))
+
 # --- Tab 5: Explainability ---
 with tab5:
     st.header("Why was this flagged?")
     shap.initjs()
     sample = X_test.sample(1, random_state=42)
     shap_values = explain_model_shap(model, sample)
+    shap_explanation = shap_values[0]  # Correct way to select a single explanation
     st.write("**Sample Explanation:**")
     st.dataframe(sample)
     st.write("SHAP Feature Contributions")
-    st.pyplot(shap.plots.waterfall(shap_values[0], show=False))
-# --- Part 6: Utilities and Constants (Boot Logic) ---
-
-# Constants (already declared earlier but re-definable here if modular)
-# ROLL_WINDOW = 60
-# ANNUALIZE = np.sqrt(252)
-# PCT_THRESHOLD = 0.95
-# EVT_TAIL_PCT = 0.99
-# SHOCK_VALUES = [0, 10, 25, 50, 100]
-
-# Reusable function for formatting metrics
-def format_metric_row(label, value, threshold):
-    delta = value - threshold
-    return f"{label}: {value:.4f} | Threshold: {threshold:.4f} | Deviation: {delta:.4f}"
-
-# Currency filter utility
-def get_currency_df(df, currency):
-    return df[df['Currency'] == currency].copy()
-
-# Boot logic for running Streamlit
-if __name__ == "__main__":
-    st.sidebar.title("FX Thresholding Controls")
-    st.sidebar.info("Select tabs above to explore thresholds, ML flags, and explanations.")
+    fig = shap.plots.waterfall(shap_explanation, show=False)
+    st.pyplot(fig)
