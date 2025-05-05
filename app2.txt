@@ -1,0 +1,168 @@
+# --- Imports ---
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+from arch import arch_model
+from scipy.stats import genpareto, kurtosis, skew
+import plotly.graph_objects as go
+
+
+# --- Constants ---
+ROLL_WINDOW = 60
+ANNUALIZE = np.sqrt(252)
+PCT_THRESHOLD = 0.95
+EVT_TAIL_PCT = 0.995
+
+# --- Data Loader ---
+@st.cache_data
+def load_fx_data():
+    df = pd.read_csv("reuters_fx_data.csv")
+    df["Date"] = pd.to_datetime(df["Date"])
+    df.sort_values(["Currency", "Date"], inplace=True)
+    df["LogReturn"] = df.groupby("Currency")["Close"].transform(lambda x: np.log(x).diff())
+    df["Volatility"] = df.groupby("Currency")["LogReturn"].transform(lambda x: x.rolling(ROLL_WINDOW).std()) * ANNUALIZE
+    return df.dropna()
+
+df = load_fx_data()
+
+# --- Manual Grouping Logic ---
+def assign_manual_group(vol):
+    if vol < 0.07:
+        return "Group 1"
+    elif vol < 0.50:
+        return "Group 2"
+    elif vol < 0.60:
+        return "Group 3"
+    else:
+        return "Group 4"
+
+# --- Threshold Computation ---
+def compute_thresholds_per_currency(df):
+    summary = []
+    for ccy, group in df.groupby("Currency"):
+        vol_series = group["Volatility"].dropna()
+        avg_vol = vol_series.mean()
+        manual_group = assign_manual_group(avg_vol)
+        manual_threshold = {"Group 1": 0.10, "Group 2": 0.25, "Group 3": 0.55, "Group 4": 0.80}[manual_group]
+
+        am = arch_model(vol_series, vol='GARCH', p=1, q=1)
+        res = am.fit(disp="off")
+        forecast = res.forecast(horizon=1).variance.values[-1][0] ** 0.5
+
+        tail_data = vol_series[vol_series > vol_series.quantile(EVT_TAIL_PCT)]
+        evt_params = genpareto.fit(tail_data)
+        evt_threshold = genpareto.ppf(0.999, *evt_params)
+
+        smile_rr = skew(group["LogReturn"].dropna()) * 0.02
+        smile_bf = (kurtosis(group["LogReturn"].dropna()) - 3) * 0.01
+        atm = avg_vol
+        smile_threshold = atm + 1.0 * smile_rr + 1.0 * smile_bf
+
+        summary.append({
+            "Currency": ccy,
+            "AvgVol": avg_vol,
+            "ManualGroup": manual_group,
+            "ManualThreshold": manual_threshold,
+            "GARCH_Forecast": forecast,
+            "95th_Pct": vol_series.quantile(PCT_THRESHOLD),
+            "EVT_Threshold": evt_threshold,
+            "ATM": atm,
+            "RR": smile_rr,
+            "BF": smile_bf,
+            "Smile_Threshold": smile_threshold
+        })
+    return pd.DataFrame(summary)
+
+df_summary = compute_thresholds_per_currency(df)
+
+# --- Streamlit UI ---
+#st.set_page_config(page_title="FX Volatility App", layout="wide")
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Overview", "Thresholds", "Cross Simulation", "Smile Threshold", "Smile Visuals"])
+
+with tab1:
+    st.title("FX Volatility Thresholding: Manual vs Model")
+    st.markdown("Compare fixed manual groupings with dynamic methods like GARCH, EVT, and smile-adjusted logic.")
+
+with tab2:
+    st.header("Threshold Comparison")
+    st.dataframe(df_summary, use_container_width=True)
+
+    sel = st.selectbox("Select Currency", df["Currency"].unique(), key="tab2_currency")
+    series = df[df["Currency"] == sel]
+    summary = df_summary[df_summary["Currency"] == sel].iloc[0]
+
+    fig = px.line(series, x="Date", y="Volatility", title=f"{sel} Volatility & Thresholds")
+    for label in ["ManualThreshold", "GARCH_Forecast", "95th_Pct", "EVT_Threshold", "Smile_Threshold"]:
+        fig.add_hline(y=summary[label], line_dash="dot", annotation_text=label)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+with tab3:
+    st.header("Cross-Currency Thresholding")
+    col1, col2 = st.columns(2)
+    with col1:
+        base = st.selectbox("Base Currency", df['Currency'].unique(), key="base_ccy")
+    with col2:
+        quote = st.selectbox("Quote Currency", df['Currency'].unique(), key="quote_ccy")
+
+    base_vals = df_summary[df_summary["Currency"] == base].select_dtypes(include=np.number).mean()
+    quote_vals = df_summary[df_summary["Currency"] == quote].select_dtypes(include=np.number).mean()
+
+    evt_cross = np.sqrt(base_vals['EVT_Threshold']**2 + quote_vals['EVT_Threshold']**2)
+    smile_cross = np.sqrt(base_vals['Smile_Threshold']**2 + quote_vals['Smile_Threshold']**2)
+    manual_cross = max(
+        df_summary[df_summary["Currency"] == base]["ManualThreshold"].values[0],
+        df_summary[df_summary["Currency"] == quote]["ManualThreshold"].values[0]
+    )
+
+    st.subheader("Cross-Pair Combined Thresholds")
+    st.metric("Cross Manual", f"{manual_cross:.4f}")
+    st.metric("Cross EVT", f"{evt_cross:.4f}")
+    st.metric("Cross Smile", f"{smile_cross:.4f}")
+
+    # Visualization: Manual, EVT, Smile per base and quote
+    comp_df = pd.DataFrame({
+        "Method": ["Manual", "EVT", "Smile"],
+        base: [
+            df_summary[df_summary["Currency"] == base]["ManualThreshold"].values[0],
+            base_vals["EVT_Threshold"],
+            base_vals["Smile_Threshold"]
+        ],
+        quote: [
+            df_summary[df_summary["Currency"] == quote]["ManualThreshold"].values[0],
+            quote_vals["EVT_Threshold"],
+            quote_vals["Smile_Threshold"]
+        ]
+    })
+
+    fig = go.Figure()
+    for method in comp_df["Method"]:
+        fig.add_trace(go.Bar(name=method, x=["Base", "Quote"], y=comp_df[comp_df["Method"] == method].iloc[0, 1:].values))
+
+    fig.update_layout(title=f"Base vs Quote Thresholds ({base} / {quote})", barmode="group", xaxis_title="Leg", yaxis_title="Threshold")
+    st.plotly_chart(fig, use_container_width=True)
+
+
+with tab4:
+    st.header("Smile-Justified Simulation (Auto)")
+    sel = st.selectbox("Select Currency", df_summary["Currency"], key="tab4_currency")
+    row = df_summary[df_summary["Currency"] == sel].iloc[0]
+
+    st.write(f"ATM: {row['ATM']:.4f}, RR: {row['RR']:.4f}, BF: {row['BF']:.4f}")
+    alpha = st.slider("Alpha (RR weight)", 0.0, 3.0, 1.0)
+    beta = st.slider("Beta (BF weight)", 0.0, 3.0, 1.0)
+
+    smile_thresh = row["ATM"] + alpha * row["RR"] + beta * row["BF"]
+    st.metric("Smile-Adjusted Threshold", f"{smile_thresh:.4f}")
+
+with tab5:
+    st.header("Smile Components Visualization")
+
+    fig = px.scatter(df_summary, x="RR", y="BF", size="Smile_Threshold",
+                     color="Currency", title="Smile Structure (RR vs BF)")
+    st.plotly_chart(fig, use_container_width=True)
+
+    fig2 = px.bar(df_summary, x="Currency", y=["ManualThreshold", "Smile_Threshold"],
+                  barmode="group", title="Manual vs Smile Threshold")
+    st.plotly_chart(fig2, use_container_width=True)
