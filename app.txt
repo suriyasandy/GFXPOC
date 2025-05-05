@@ -1,265 +1,134 @@
-# --- Part 1: App Setup, Imports, and Data Loader ---
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from scipy.stats import genpareto
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-import ta  # For technical indicators
+import matplotlib.pyplot as plt
+from arch import arch_model
+from scipy.stats import genpareto, kurtosis, skew
 
 ROLL_WINDOW = 60
 ANNUALIZE = np.sqrt(252)
 PCT_THRESHOLD = 0.95
-EVT_TAIL_PCT = 0.99
-SHOCK_VALUES = [0, 10, 25, 50, 100]
+EVT_TAIL_PCT = 0.995
 
-# Load and preprocess FX OHLC + compute indicators
 @st.cache_data
 def load_fx_data():
     df = pd.read_csv("reuters_fx_data.csv")
-    df['Date'] = pd.to_datetime(df['Date'])
-    df.sort_values(['Currency', 'Date'], inplace=True)
-    
-    # Group by Currency and apply indicators
-    result = []
-    for ccy, group in df.groupby('Currency'):
-        group = group.copy()
-        group['LogReturn'] = np.log(group['Close'] / group['Close'].shift(1))
-        group['Volatility'] = group['LogReturn'].rolling(ROLL_WINDOW).std() * ANNUALIZE
-        group['RSI'] = ta.momentum.RSIIndicator(close=group['Close'], window=14).rsi()
-        group['MACD'] = ta.trend.MACD(close=group['Close']).macd()
-        group['BBWidth'] = ta.volatility.BollingerBands(close=group['Close']).bollinger_wband()
-        result.append(group)
-    
-    df_full = pd.concat(result).dropna().reset_index(drop=True)
-    return df_full
+    df["Date"] = pd.to_datetime(df["Date"])
+    df.sort_values(["Currency", "Date"], inplace=True)
+    df["LogReturn"] = df.groupby("Currency")["Close"].transform(lambda x: np.log(x).diff())
+    df["Volatility"] = df.groupby("Currency")["LogReturn"].transform(lambda x: x.rolling(ROLL_WINDOW).std()) * ANNUALIZE
+    return df.dropna()
 
-# Manual threshold bands
-MANUAL_BANDS = [(0.0, 0.07), (0.07, 0.5), (0.5, 0.6), (0.6, float("inf"))]
-MANUAL_THRESHOLDS = [0.10, 0.40, 0.70, 1.30]
+df = load_fx_data()
 
-def assign_manual_threshold(vol):
-    for (low, high), th in zip(MANUAL_BANDS, MANUAL_THRESHOLDS):
-        if low <= vol < high:
-            return th
-    return MANUAL_THRESHOLDS[-1]
-# --- Part 2: Threshold Calculations ---
 
-# Rolling statistical threshold (95th percentile)
-def calc_stat_threshold(vol_series):
-    return vol_series.quantile(PCT_THRESHOLD)
+def assign_manual_group(vol):
+    if vol < 0.07:
+        return "Group 1"
+    elif vol < 0.50:
+        return "Group 2"
+    elif vol < 0.60:
+        return "Group 3"
+    else:
+        return "Group 4"
 
-# EVT threshold (Peaks Over Threshold method)
-def calc_evt_threshold(vol_series):
-    threshold = vol_series.quantile(EVT_TAIL_PCT)
-    tail_data = vol_series[vol_series > threshold] - threshold
-    if len(tail_data) < 10:
-        return threshold  # Not enough data to fit
-    params = genpareto.fit(tail_data)
-    return threshold + genpareto.ppf(0.995, *params)
-
-# Placeholder for GARCH (to be implemented using arch library if needed)
-def calc_garch_forecast(vol_series):
-    return vol_series.mean() * 1.25  # Dummy multiplier; replace with GARCH forecast later
-
-# Apply thresholds per currency
 def compute_thresholds_per_currency(df):
-    records = []
+    summary = []
     for ccy, group in df.groupby("Currency"):
-        recent_vols = group["Volatility"]
-        stat_th = calc_stat_threshold(recent_vols)
-        evt_th = calc_evt_threshold(recent_vols)
-        garch_th = calc_garch_forecast(recent_vols)
-        avg_vol = recent_vols.mean()
-        manual_th = assign_manual_threshold(avg_vol)
-        records.append({
+        vol_series = group["Volatility"].dropna()
+        avg_vol = vol_series.mean()
+        manual_group = assign_manual_group(avg_vol)
+        manual_threshold = {"Group 1": 0.10, "Group 2": 0.25, "Group 3": 0.55, "Group 4": 0.80}[manual_group]
+
+        am = arch_model(vol_series, vol='GARCH', p=1, q=1)
+        res = am.fit(disp="off")
+        forecast = res.forecast(horizon=1).variance.values[-1][0] ** 0.5
+
+        tail_data = vol_series[vol_series > vol_series.quantile(EVT_TAIL_PCT)]
+        evt_params = genpareto.fit(tail_data)
+        evt_threshold = genpareto.ppf(0.999, *evt_params)
+
+        smile_rr = skew(group["LogReturn"].dropna()) * 0.02
+        smile_bf = (kurtosis(group["LogReturn"].dropna()) - 3) * 0.01
+        atm = avg_vol
+        smile_threshold = atm + 1.0 * smile_rr + 1.0 * smile_bf
+
+        summary.append({
             "Currency": ccy,
-            "ManualThreshold": manual_th,
-            "StatThreshold": stat_th,
-            "EVTThreshold": evt_th,
-            "GARCHThreshold": garch_th,
-            "AvgVol": avg_vol
+            "AvgVol": avg_vol,
+            "ManualGroup": manual_group,
+            "ManualThreshold": manual_threshold,
+            "GARCH_Forecast": forecast,
+            "95th_Pct": vol_series.quantile(PCT_THRESHOLD),
+            "EVT_Threshold": evt_threshold,
+            "ATM": atm,
+            "RR": smile_rr,
+            "BF": smile_bf,
+            "Smile_Threshold": smile_threshold
         })
-    return pd.DataFrame(records)
-# --- Part 3: Cross-Currency Synthetic Thresholding and Shock Simulation ---
+    return pd.DataFrame(summary)
 
-def compute_synthetic_threshold(base_vol, quote_vol):
-    return np.sqrt(base_vol**2 + quote_vol**2)
+df_summary = compute_thresholds_per_currency(df)
 
-def get_latest_vol(df, ccy):
-    df_ccy = df[df["Currency"] == ccy].copy()
-    return df_ccy["Volatility"].iloc[-1]
 
-def simulate_shock_threshold(base_vol, quote_vol, base_shock=0, quote_shock=0):
-    shocked_base = base_vol * (1 + base_shock / 100)
-    shocked_quote = quote_vol * (1 + quote_shock / 100)
-    return compute_synthetic_threshold(shocked_base, shocked_quote)
+st.set_page_config(page_title="FX Volatility App", layout="wide")
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Overview", "Thresholds", "Cross Simulation", "Smile Threshold", "Smile Visuals"])
 
-# Function to return shock scenario DataFrame
-def generate_shock_table(base_vol, quote_vol):
-    rows = []
-    for bshock in SHOCK_VALUES:
-        for qshock in SHOCK_VALUES:
-            shocked_thresh = simulate_shock_threshold(base_vol, quote_vol, bshock, qshock)
-            rows.append({
-                "Base Shock %": bshock,
-                "Quote Shock %": qshock,
-                "Synthetic Threshold": shocked_thresh
-            })
-    return pd.DataFrame(rows)
-# --- Part 4: ML Model (Random Forest) + SHAP Explainability ---
-
-import shap
-
-@st.cache_resource
-def train_rf_model(df):
-    features = ["Volatility", "RSI", "MACD", "BBWidth"]
-    df = df.dropna(subset=features)
-    df["HighVolFlag"] = df["Volatility"] > df.groupby("Currency")["Volatility"].transform(lambda x: x.quantile(PCT_THRESHOLD))
-    
-    X = df[features]
-    y = df["HighVolFlag"].astype(int)
-    X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, test_size=0.3, random_state=42)
-
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-
-    model = RandomForestClassifier(n_estimators=100, random_state=42)
-    model.fit(X_train_scaled, y_train)
-
-    return model, scaler, X_test, X_test_scaled, y_test
-
-def explain_model_shap(model, X_sample):
-    explainer = shap.Explainer(model)
-    shap_values = explainer(X_sample)
-    return shap_values
-
-def predict_and_explain(df, model, scaler):
-    features = ["Volatility", "RSI", "MACD", "BBWidth"]
-    df = df.dropna(subset=features).copy()
-    df["VolFlag_RF"] = model.predict(scaler.transform(df[features]))
-    return df
-# --- Part 5: Streamlit UI Assembly ---
-
-df = load_fx_data()
-st.set_page_config(layout="wide")
-st.title("FX Volatility Thresholding: Hybrid ML + Statistical App")
-
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "Overview",
-    "Per-Currency Thresholds",
-    "Cross-Currency Shock Simulation",
-    "ML Flags + SHAP",
-    "Explainability"
-])
-
-# --- Tab 1: Overview ---
 with tab1:
-    st.header("Business Rationale")
-    st.markdown("""
-    - Manual thresholds are rigid and miss key spikes.
-    - We replace them with dynamic, explainable thresholds:
-      - 95th percentile (statistical)
-      - EVT (tail-fit)
-      - GARCH (forecast)
-      - Random Forest with SHAP explanations
-    """)
+    st.title("FX Volatility Thresholding: Manual vs Model")
+    st.markdown("Compare fixed manual groupings with dynamic methods like GARCH, EVT, and smile-adjusted logic.")
 
-# --- Tab 2: Thresholds ---
 with tab2:
-    st.header("Per-Currency Threshold View")
-    df_summary = compute_thresholds_per_currency(df)
-    st.dataframe(df_summary.style.format("{:.4f}"))
+    st.header("Threshold Comparison")
+    st.dataframe(df_summary, use_container_width=True)
 
-# --- Tab 3: Cross-Currency Simulation ---
+    sel = st.selectbox("Select Currency", df["Currency"].unique(), key="tab2_currency")
+    series = df[df["Currency"] == sel]
+    summary = df_summary[df_summary["Currency"] == sel].iloc[0]
+
+    fig = px.line(series, x="Date", y="Volatility", title=f"{sel} Volatility & Thresholds")
+    for label in ["ManualThreshold", "GARCH_Forecast", "95th_Pct", "EVT_Threshold", "Smile_Threshold"]:
+        fig.add_hline(y=summary[label], line_dash="dot", annotation_text=label)
+    st.plotly_chart(fig, use_container_width=True)
+
 with tab3:
-    st.header("Cross-Currency Threshold Simulation")
-    currencies = df["Currency"].unique().tolist()
-    base = st.selectbox("Base Currency", currencies, key="base")
-    quote = st.selectbox("Quote Currency", currencies, key="quote")
+    st.header("Cross-Currency Thresholding")
+    col1, col2 = st.columns(2)
+    with col1:
+        base = st.selectbox("Base Currency", df['Currency'].unique())
+    with col2:
+        quote = st.selectbox("Quote Currency", df['Currency'].unique())
 
-    base_vol = get_latest_vol(df, base)
-    quote_vol = get_latest_vol(df, quote)
-    st.metric(f"{base} Vol", f"{base_vol:.4f}")
-    st.metric(f"{quote} Vol", f"{quote_vol:.4f}")
+    base_vals = df_summary[df_summary["Currency"] == base].select_dtypes(include=np.number).mean()
+    quote_vals = df_summary[df_summary["Currency"] == quote].select_dtypes(include=np.number).mean()
 
-    table = generate_shock_table(base_vol, quote_vol)
-    st.dataframe(table.style.format("{:.4f}"))
+    st.metric("Cross EVT", f"{np.sqrt(base_vals['EVT_Threshold']**2 + quote_vals['EVT_Threshold']**2):.4f}")
+    st.metric("Cross Smile", f"{np.sqrt(base_vals['Smile_Threshold']**2 + quote_vals['Smile_Threshold']**2):.4f}")
 
-# --- Tab 4: ML Flags ---
+
 with tab4:
-    st.header("ML-Based Flagging")
-    model, scaler, X_test, X_test_scaled, y_test = train_rf_model(df)
-    flagged_df = predict_and_explain(df, model, scaler)
-    st.dataframe(flagged_df[["Currency", "Date", "Volatility", "RSI", "MACD", "BBWidth", "VolFlag_RF"]].tail(10))
+    st.header("Smile-Justified Simulation (Auto)")
+    sel = st.selectbox("Select Currency", df_summary["Currency"])
+    row = df_summary[df_summary["Currency"] == sel].iloc[0]
 
-# --- Part 5: Streamlit UI Assembly (Updated with SHAP fix) ---
+    st.write(f"ATM: {row['ATM']:.4f}, RR: {row['RR']:.4f}, BF: {row['BF']:.4f}")
+    alpha = st.slider("Alpha (RR weight)", 0.0, 3.0, 1.0)
+    beta = st.slider("Beta (BF weight)", 0.0, 3.0, 1.0)
 
-df = load_fx_data()
-st.set_page_config(layout="wide")
-st.title("FX Volatility Thresholding: Hybrid ML + Statistical App")
+    smile_thresh = row["ATM"] + alpha * row["RR"] + beta * row["BF"]
+    st.metric("Smile-Adjusted Threshold", f"{smile_thresh:.4f}")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "Overview",
-    "Per-Currency Thresholds",
-    "Cross-Currency Shock Simulation",
-    "ML Flags + SHAP",
-    "Explainability"
-])
 
-# --- Tab 1: Overview ---
-with tab1:
-    st.header("Business Rationale")
-    st.markdown("""
-    - Manual thresholds are rigid and miss key spikes.
-    - We replace them with dynamic, explainable thresholds:
-      - 95th percentile (statistical)
-      - EVT (tail-fit)
-      - GARCH (forecast)
-      - Random Forest with SHAP explanations
-    """)
-
-# --- Tab 2: Thresholds ---
-with tab2:
-    st.header("Per-Currency Threshold View")
-    df_summary = compute_thresholds_per_currency(df)
-    st.dataframe(df_summary.style.format("{:.4f}"))
-
-# --- Tab 3: Cross-Currency Simulation ---
-with tab3:
-    st.header("Cross-Currency Threshold Simulation")
-    currencies = df["Currency"].unique().tolist()
-    base = st.selectbox("Base Currency", currencies, key="base")
-    quote = st.selectbox("Quote Currency", currencies, key="quote")
-
-    base_vol = get_latest_vol(df, base)
-    quote_vol = get_latest_vol(df, quote)
-    st.metric(f"{base} Vol", f"{base_vol:.4f}")
-    st.metric(f"{quote} Vol", f"{quote_vol:.4f}")
-
-    table = generate_shock_table(base_vol, quote_vol)
-    st.dataframe(table.style.format("{:.4f}"))
-
-# --- Tab 4: ML Flags ---
-with tab4:
-    st.header("ML-Based Flagging")
-    model, scaler, X_test, X_test_scaled, y_test = train_rf_model(df)
-    flagged_df = predict_and_explain(df, model, scaler)
-    st.dataframe(flagged_df[["Currency", "Date", "Volatility", "RSI", "MACD", "BBWidth", "VolFlag_RF"]].tail(10))
-
-# --- Tab 5: Explainability ---
 with tab5:
-    st.header("Why was this flagged?")
-    shap.initjs()
-    sample = X_test.sample(1, random_state=42)
-    shap_values = explain_model_shap(model, sample)
-    shap_explanation = shap_values[0]  # Correct way to select a single explanation
-    st.write("**Sample Explanation:**")
-    st.dataframe(sample)
-    st.write("SHAP Feature Contributions")
-    fig = shap.plots.waterfall(shap_explanation, show=False)
-    st.pyplot(fig)
+    st.header("Smile Components Visualization")
+
+    fig = px.scatter(df_summary, x="RR", y="BF", size="Smile_Threshold",
+                     color="Currency", title="Smile Structure (RR vs BF)")
+    st.plotly_chart(fig, use_container_width=True)
+
+    fig2 = px.bar(df_summary, x="Currency", y=["ManualThreshold", "Smile_Threshold"],
+                  barmode="group", title="Manual vs Smile Threshold")
+    st.plotly_chart(fig2, use_container_width=True)
