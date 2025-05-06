@@ -1,0 +1,307 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import talib
+from arch import arch_model
+from scipy.stats import genpareto
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolute_percentage_error
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import Ridge, LinearRegression
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from prophet import Prophet
+from pmdarima import auto_arima
+import plotly.express as px
+import plotly.graph_objects as go
+
+# ---------------------------------------
+# Constants
+# ---------------------------------------
+ROLL_WINDOW = 60
+ANNUALIZE = np.sqrt(252)
+PCT_THRESHOLD = 0.95
+EVT_TAIL_PCT = 0.995
+
+# ---------------------------------------
+# Streamlit page config & CSS
+# ---------------------------------------
+st.set_page_config(page_title="FX Volatility & Forecast Thresholds", layout="wide")
+st.markdown("""
+    <style>
+    .stApp { background-color: #111; color: white; }
+    .stMarkdown { color: white; }
+    </style>
+""", unsafe_allow_html=True)
+
+# ---------------------------------------
+# Data loading & Feature Engineering
+# ---------------------------------------
+@st.cache_data
+def load_fx_data(path="reuters_fx_data.csv"):
+    df = pd.read_csv(path)
+    df["Date"] = pd.to_datetime(df["Date"])
+    # slug column for consistency with other code
+    df["slug"] = df["Currency"] + "/USD"
+    df.sort_values(["Currency", "Date"], inplace=True)
+    # basic features
+    df["LogReturn"] = df.groupby("Currency")["Close"].transform(lambda x: np.log(x).diff())
+    df["Volatility"] = df.groupby("Currency")["LogReturn"].transform(lambda x: x.rolling(ROLL_WINDOW).std()) * ANNUALIZE
+
+    # --- Technical indicators via TA-Lib ---
+    for ccy in df["Currency"].unique():
+        mask = df["Currency"] == ccy
+        close = df.loc[mask, "Close"].astype(float)
+        high  = df.loc[mask, "High"].astype(float)
+        low   = df.loc[mask, "Low"].astype(float)
+
+        df.loc[mask, "RSI"] = talib.RSI(close.values, timeperiod=14)
+        macd, macdsig, macdhist = talib.MACD(close.values, fastperiod=12, slowperiod=26, signalperiod=9)
+        df.loc[mask, "MACD"]        = macd
+        df.loc[mask, "MACD_Signal"] = macdsig
+        df.loc[mask, "MACD_Hist"]   = macdhist
+        upper, middle, lower = talib.BBANDS(close.values, timeperiod=20)
+        df.loc[mask, "BB_upper"] = upper
+        df.loc[mask, "BB_middle"] = middle
+        df.loc[mask, "BB_lower"] = lower
+        df.loc[mask, "ATR"] = talib.ATR(high.values, low.values, close.values, timeperiod=14)
+
+    return df.dropna()
+
+df = load_fx_data()
+
+# ---------------------------------------
+# Manual vs Dynamic Volatility Thresholds
+# ---------------------------------------
+def assign_manual_group(vol):
+    if vol < 0.07:   return "Group 1"
+    elif vol < 0.50: return "Group 2"
+    elif vol < 0.60: return "Group 3"
+    else:            return "Group 4"
+
+@st.cache_data
+def compute_vol_thresholds(df):
+    rows = []
+    for ccy, grp in df.groupby("Currency"):
+        vs = grp["Volatility"]
+        avg_vol = vs.mean()
+        mg = assign_manual_group(avg_vol)
+        manual_thr = {"Group 1":0.10,"Group 2":0.25,"Group 3":0.55,"Group 4":0.80}[mg]
+
+        # GARCH forecast
+        am = arch_model(vs, vol="GARCH", p=1, q=1)
+        res = am.fit(disp="off")
+        garch_thr = res.forecast(horizon=1).variance.values[-1][0] ** 0.5
+
+        # EVT tail threshold
+        tail = vs[vs > vs.quantile(EVT_TAIL_PCT)]
+        params = genpareto.fit(tail)
+        evt_thr = genpareto.ppf(0.999, *params)
+
+        rows.append({
+            "Currency": ccy,
+            "AvgVol": avg_vol,
+            "ManualThreshold": manual_thr,
+            "GARCH_Forecast": garch_thr,
+            "95th_Pct": vs.quantile(PCT_THRESHOLD),
+            "EVT_Threshold": evt_thr
+        })
+    return pd.DataFrame(rows)
+
+df_vol_thr = compute_vol_thresholds(df)
+
+# ---------------------------------------
+# Forecast‐based Thresholds (MAPE from ARIMA & Prophet)
+# ---------------------------------------
+@st.cache_data
+def compute_forecast_thresholds(df):
+    rows = []
+    for ccy, grp in df.groupby("Currency"):
+        ts = grp.set_index("Date")["Close"].asfreq("B").fillna(method="ffill")
+        n = len(ts)
+        split = int(n*0.9)
+        train, test = ts.iloc[:split], ts.iloc[split:]
+
+        # --- ARIMA ---
+        arima = auto_arima(train, seasonal=False, suppress_warnings=True)
+        arima_pred = pd.Series(arima.predict(n_periods=len(test)), index=test.index)
+        arima_mape = (np.abs(test - arima_pred)/test).mean()*100
+
+        # --- Prophet ---
+        pdf = train.reset_index().rename(columns={"Date":"ds","Close":"y"})
+        m = Prophet(daily_seasonality=False, weekly_seasonality=True)
+        m.fit(pdf)
+        future = m.make_future_dataframe(periods=len(test), freq="B")
+        fc = m.predict(future).set_index("ds")["yhat"].iloc[-len(test):]
+        prophet_mape = (np.abs(test - fc)/test).mean()*100
+
+        # combined threshold = max
+        combined_thr = max(arima_mape, prophet_mape)
+        rows.append({
+            "Currency": ccy,
+            "ARIMA_MAPE": arima_mape,
+            "Prophet_MAPE": prophet_mape,
+            "Forecast_Threshold": combined_thr
+        })
+    return pd.DataFrame(rows)
+
+df_frc_thr = compute_forecast_thresholds(df)
+
+# Merge all threshold tables
+df_summary = df_vol_thr.merge(df_frc_thr, on="Currency")
+
+# ---------------------------------------
+# Streamlit UI
+# ---------------------------------------
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "Overview",
+    "Threshold Comparison",
+    "Feature Engineering",
+    "Recalibration Simulation",
+    "Live Forecasting"
+])
+
+# 1) Overview
+with tab1:
+    st.title("📊 FX Off‐Market Rate Checking: End‐to‐End")
+    st.markdown("""
+    **Post‐trade middle‐office** checks flag deals whose deviation 
+    from market benchmarks exceeds thresholds.  
+    - **Manual** thresholds are static and coarse.  
+    - **Volatility‐based** thresholds (GARCH, EVT, rolling) adapt dynamically.  
+    - **Forecast‐based** thresholds use %MAPE from ARIMA/Prophet.  
+    - **Technical indicators** (RSI, MACD, Bollinger, ATR) enrich feature space.  
+    - We compare *all* thresholds and show how ML models can help.
+    """)
+
+# 2) Threshold Comparison
+with tab2:
+    st.header("🔖 Thresholds: Manual vs. Dynamic vs. Forecast")
+    st.dataframe(df_summary, use_container_width=True)
+
+    cur = st.selectbox("Select Currency", df_summary["Currency"].unique())
+    row = df_summary[df_summary.Currency==cur].iloc[0]
+
+    # Volatility chart with all thresholds
+    vol_series = df[df.Currency==cur]
+    fig = px.line(vol_series, x="Date", y="Volatility", title=f"{cur} Volatility & Thresholds")
+    for label in ["ManualThreshold","GARCH_Forecast","95th_Pct","EVT_Threshold","Forecast_Threshold"]:
+        fig.add_hline(y=row[label], line_dash="dot", annotation_text=label)
+    st.plotly_chart(fig, use_container_width=True)
+
+# 3) Feature Engineering
+with tab3:
+    st.header("🛠 Feature Engineering")
+    cur = st.selectbox("Currency for Indicators", df["Currency"].unique(), key="feat_ccy")
+    d = df[df.Currency==cur].set_index("Date")
+    # Price + RSI
+    fig1 = go.Figure()
+    fig1.add_trace(go.Scatter(x=d.index, y=d.Close, name="Close"))
+    fig2 = go.Figure()
+    fig2.add_trace(go.Scatter(x=d.index, y=d.RSI, name="RSI"))
+    # MACD
+    fig3 = go.Figure()
+    fig3.add_trace(go.Scatter(x=d.index, y=d.MACD,        name="MACD"))
+    fig3.add_trace(go.Scatter(x=d.index, y=d.MACD_Signal, name="Signal"))
+    fig3.add_trace(go.Bar(    x=d.index, y=d.MACD_Hist,   name="Hist"))
+    # Bollinger
+    fig4 = go.Figure()
+    fig4.add_trace(go.Scatter(x=d.index, y=d.Close,       name="Close"))
+    fig4.add_trace(go.Scatter(x=d.index, y=d.BB_upper,    name="BB_upper",  line=dict(dash="dash")))
+    fig4.add_trace(go.Scatter(x=d.index, y=d.BB_middle,   name="BB_middle", line=dict(dash="dot")))
+    fig4.add_trace(go.Scatter(x=d.index, y=d.BB_lower,    name="BB_lower",  line=dict(dash="dash")))
+    # ATR
+    fig5 = px.line(d, y="ATR", title="ATR")
+
+    st.plotly_chart(fig1, use_container_width=True)
+    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig3, use_container_width=True)
+    st.plotly_chart(fig4, use_container_width=True)
+    st.plotly_chart(fig5, use_container_width=True)
+
+# 4) Recalibration Simulation (unchanged)
+with tab4:
+    st.header("🚨 Shock Simulation & Recalibration")
+    shock_date = st.date_input("Shock End Date", pd.to_datetime("2024-11-01"))
+    roll = st.slider("Rolling Window", 10, 90, ROLL_WINDOW)
+    # ... (same logic as in your v1 code) ...
+    st.info("Simulation logic omitted here for brevity; integrate your existing shock‐generation & recalibration code.")
+
+# 5) Live FX Rate Forecasting
+with tab5:
+    st.header("🤖 Live Forecasting & Off‐Market Flagging")
+    suffix = st.selectbox("Dataset", ["Original","Original + Shock"], index=0)
+    data_in = df if suffix=="Original" else pd.read_csv("reuters_gfx_test_data.csv")
+    data_in["Date"] = pd.to_datetime(data_in["Date"])
+    cur = st.selectbox("Select Currency to Forecast", data_in["Currency"].unique(), key="fc_sec")
+    df_ccy = data_in[data_in.Currency==cur].set_index("Date")[["Close"]]
+
+    # Prepare sequences
+    def make_seqs(arr, w): return np.array([arr[i:i+w] for i in range(len(arr)-w)]),\
+                                    np.array([arr[i+w] for i in range(len(arr)-w)])
+    scaler = MinMaxScaler()
+    scaled = scaler.fit_transform(df_ccy)
+    W = 30
+    X, y = make_seqs(scaled, W)
+    X_rf = X.reshape(len(X), -1)
+    X_lstm = X.reshape(len(X), W, 1)
+    split = int(0.8*len(X))
+    Xtr_rf, Xte_rf = X_rf[:split], X_rf[split:]
+    Xtr_lstm, Xte_lstm = X_lstm[:split], X_lstm[split:]
+    ytr, yte = y[:split], y[split:]
+
+    results = {}
+    # RF
+    rf = GridSearchCV(RandomForestRegressor(42),
+                      {"n_estimators":[50,100],"max_depth":[5,10,None]}, cv=3)
+    rf.fit(Xtr_rf, ytr.ravel())
+    results["RF"] = rf.predict(Xte_rf)
+    # LSTM
+    from keras.models import Sequential
+    from keras.layers import LSTM, Dropout, Dense
+    m = Sequential([
+        LSTM(64, input_shape=(W,1)),
+        Dropout(0.2),
+        Dense(1)
+    ])
+    m.compile("adam","mse")
+    m.fit(Xtr_lstm, ytr, epochs=30, batch_size=16, verbose=0)
+    results["LSTM"] = m.predict(Xte_lstm).ravel()
+    # Linear
+    lr = LinearRegression().fit(Xtr_rf, ytr)
+    results["LinReg"] = lr.predict(Xte_rf)
+    # Ridge
+    ridge = GridSearchCV(Ridge(),{"alpha":[0.1,1,10]},cv=3).fit(Xtr_rf,ytr.ravel())
+    results["Ridge"] = ridge.predict(Xte_rf)
+    # KNN
+    knn = GridSearchCV(KNeighborsRegressor(),{"n_neighbors":[3,5,7]},cv=3).fit(Xtr_rf,ytr.ravel())
+    results["KNN"] = knn.predict(Xte_rf)
+    # SVR
+    svr = GridSearchCV(SVR(),{"C":[0.1,1,10],"kernel":["linear","rbf"]},cv=3)\
+          .fit(Xtr_rf,ytr.ravel())
+    results["SVR"] = svr.predict(Xte_rf)
+
+    # Plot & metrics
+    y_true = scaler.inverse_transform(yte.reshape(-1,1)).flatten()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df_ccy.index[-len(y_true):], y=y_true, name="Actual", line_color="white"))
+    metrics = []
+    for name, pred in results.items():
+        pi = scaler.inverse_transform(pred.reshape(-1,1)).flatten()
+        fig.add_trace(go.Scatter(x=df_ccy.index[-len(y_true):], y=pi, name=name))
+        mape = mean_absolute_percentage_error(y_true, pi)*100
+        metrics.append((name, round(mape,2)))
+    st.plotly_chart(fig, use_container_width=True)
+
+    dfm = pd.DataFrame(metrics, columns=["Model","MAPE (%)"])
+    st.subheader("Model MAPE (%)")
+    st.dataframe(dfm, use_container_width=True)
+
+    # Use highest MAPE as off‐market threshold
+    thresh = dfm["MAPE (%)"].max()
+    st.markdown(f"**Off‐Market Threshold** = {thresh:.2f}% (max MAPE across models)")
+
+    st.markdown("""
+    Any deal deviating by more than this % from the forecast is flagged as **off-market**.
+    """)
