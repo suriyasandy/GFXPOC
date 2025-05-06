@@ -1,0 +1,126 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+import matplotlib.pyplot as plt
+from arch import arch_model
+from scipy.stats import genpareto, kurtosis, skew
+
+ROLL_WINDOW = 60
+ANNUALIZE = np.sqrt(252)
+PCT_THRESHOLD = 0.95
+EVT_TAIL_PCT = 0.995
+
+@st.cache_data
+def load_fx_data():
+    df = pd.read_csv("reuters_fx_data.csv")
+    df["Date"] = pd.to_datetime(df["Date"])
+    df.sort_values(["Currency", "Date"], inplace=True)
+    df["LogReturn"] = df.groupby("Currency")["Close"].transform(lambda x: np.log(x).diff())
+    df["Volatility"] = df.groupby("Currency")["LogReturn"].transform(lambda x: x.rolling(ROLL_WINDOW).std()) * ANNUALIZE
+    return df.dropna()
+
+df = load_fx_data()
+
+def assign_manual_group(vol):
+    if vol < 0.07:
+        return "Group 1"
+    elif vol < 0.50:
+        return "Group 2"
+    elif vol < 0.60:
+        return "Group 3"
+    else:
+        return "Group 4"
+
+def compute_thresholds_per_currency(df):
+    summary = []
+    for ccy, group in df.groupby("Currency"):
+        vol_series = group["Volatility"].dropna()
+        avg_vol = vol_series.mean()
+        manual_group = assign_manual_group(avg_vol)
+        manual_threshold = {"Group 1": 0.10, "Group 2": 0.25, "Group 3": 0.55, "Group 4": 0.80}[manual_group]
+
+        am = arch_model(vol_series, vol='GARCH', p=1, q=1)
+        res = am.fit(disp="off")
+        forecast = res.forecast(horizon=1).variance.values[-1][0] ** 0.5
+
+        tail_data = vol_series[vol_series > vol_series.quantile(EVT_TAIL_PCT)]
+        evt_params = genpareto.fit(tail_data)
+        evt_threshold = genpareto.ppf(0.999, *evt_params)
+
+        smile_rr = skew(group["LogReturn"].dropna()) * 0.02
+        smile_bf = (kurtosis(group["LogReturn"].dropna()) - 3) * 0.01
+        atm = avg_vol
+        smile_threshold = atm + 1.0 * smile_rr + 1.0 * smile_bf
+
+        summary.append({
+            "Currency": ccy,
+            "AvgVol": avg_vol,
+            "ManualGroup": manual_group,
+            "ManualThreshold": manual_threshold,
+            "GARCH_Forecast": forecast,
+            "95th_Pct": vol_series.quantile(PCT_THRESHOLD),
+            "EVT_Threshold": evt_threshold,
+            "ATM": atm,
+            "RR": smile_rr,
+            "BF": smile_bf,
+            "Smile_Threshold": smile_threshold
+        })
+    return pd.DataFrame(summary)
+
+df_summary = compute_thresholds_per_currency(df)
+
+st.set_page_config(page_title="FX Volatility App", layout="wide")
+tabs = st.tabs([
+    "Overview", "Thresholds", "Cross Simulation",
+    "Smile Threshold", "Smile Visuals", "Recalibration Simulation",
+    "Volatility Model"
+])
+
+tab7 = tabs[6]
+
+with tab7:
+    st.header("Volatility Model (Heston Simulation)")
+    st.markdown("""
+    This simulation uses the **Heston Stochastic Volatility Model** to generate a path of both asset prices and volatility.
+    It helps visualize how volatility behaves under a mean-reverting stochastic process.
+    """)
+
+    st.subheader("Model Parameters")
+    S0 = st.number_input("Initial Price (S₀)", value=100.0)
+    v0 = st.number_input("Initial Volatility (v₀)", value=0.04)
+    kappa = st.slider("Mean Reversion Speed (κ)", 0.1, 5.0, 2.0)
+    theta = st.slider("Long-term Volatility (θ)", 0.01, 0.2, 0.04)
+    sigma = st.slider("Vol of Vol (σ)", 0.01, 1.0, 0.5)
+    rho = st.slider("Correlation (ρ)", -1.0, 1.0, -0.7)
+    r = st.slider("Risk-Free Rate (r)", 0.0, 0.1, 0.02)
+    T = st.slider("Time Horizon (Years)", 0.1, 2.0, 1.0)
+    N = st.slider("Steps", 100, 1000, 250)
+
+    dt = T / N
+    prices = [S0]
+    volatilities = [v0]
+    np.random.seed(42)
+
+    for _ in range(N):
+        z1, z2 = np.random.normal(size=2)
+        dw1 = np.sqrt(dt) * z1
+        dw2 = rho * dw1 + np.sqrt(1 - rho**2) * np.sqrt(dt) * z2
+
+        vt = volatilities[-1]
+        vt_new = np.abs(vt + kappa * (theta - vt) * dt + sigma * np.sqrt(vt) * dw2)
+        st_new = prices[-1] * np.exp((r - 0.5 * vt) * dt + np.sqrt(vt) * dw1)
+
+        volatilities.append(vt_new)
+        prices.append(st_new)
+
+    st.subheader("Simulation Results")
+    df_sim = pd.DataFrame({"Price": prices, "Volatility": volatilities})
+    df_sim["Step"] = range(len(df_sim))
+
+    fig_price = px.line(df_sim, x="Step", y="Price", title="Simulated Price Path")
+    fig_vol = px.line(df_sim, x="Step", y="Volatility", title="Simulated Volatility Path")
+
+    st.plotly_chart(fig_price, use_container_width=True)
+    st.plotly_chart(fig_vol, use_container_width=True)
