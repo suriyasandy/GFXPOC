@@ -1,0 +1,51 @@
+with tab6:
+    st.header("Real-Time Recalibration Simulation")
+
+    # Step 1: Create reuters_gfx_test_data.csv only once
+    base_df = df.copy()
+    impacted_currencies = ["INR", "JPY", "GBP"]
+    shock_start = pd.to_datetime("2024-10-15")
+    shock_end = pd.to_datetime("2024-11-01")
+
+    df_test = base_df.copy()
+    df_test["ShockFactor"] = 1.0
+    df_test.loc[
+        (df_test["Currency"].isin(impacted_currencies)) & (df_test["Date"] >= shock_start) & (df_test["Date"] <= shock_end),
+        "ShockFactor"
+    ] = np.random.normal(loc=1.5, scale=0.1, size=((df_test["Currency"].isin(impacted_currencies)) & (df_test["Date"] >= shock_start) & (df_test["Date"] <= shock_end)).sum())
+
+    df_test["Close_Shocked"] = df_test["Close"] * df_test["ShockFactor"]
+    df_test["LogReturn_Shocked"] = df_test.groupby("Currency")["Close_Shocked"].transform(lambda x: np.log(x).diff())
+    df_test["Volatility"] = df_test.groupby("Currency")["LogReturn_Shocked"].transform(lambda x: x.rolling(ROLL_WINDOW).std()) * ANNUALIZE
+    df_test = df_test.dropna()
+    df_test[["Currency", "Date", "Close_Shocked", "Volatility"]].to_csv("reuters_gfx_test_data.csv", index=False)
+
+    st.success("📁 `reuters_gfx_test_data.csv` created with shocked volatility.")
+
+    # Step 2: Load and analyze
+    st.subheader("Recalibrated Thresholds Using Test Data")
+    test_df = pd.read_csv("reuters_gfx_test_data.csv")
+    test_df["Date"] = pd.to_datetime(test_df["Date"])
+
+    dynamic_recalibrated = test_df.groupby("Currency").agg(
+        AvgVol_Shocked=("Volatility", "mean"),
+        New95thPct=("Volatility", lambda x: x.quantile(PCT_THRESHOLD)),
+        NewEVT=("Volatility", lambda x: genpareto.ppf(0.999, *genpareto.fit(x[x > x.quantile(EVT_TAIL_PCT)])))
+    ).reset_index()
+
+    merged = df_summary[["Currency", "ManualThreshold"]].merge(dynamic_recalibrated, on="Currency", how="inner")
+
+    st.dataframe(merged, use_container_width=True)
+
+    fig = px.bar(merged.melt(id_vars="Currency", value_vars=["ManualThreshold", "New95thPct", "NewEVT"]),
+                 x="Currency", y="value", color="variable", barmode="group",
+                 title="Manual vs Recalibrated Thresholds (Post-Volatility Shock)",
+                 labels={"value": "Threshold", "variable": "Method"})
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Insight")
+    st.markdown("""
+    - Manual thresholds remain unchanged despite post-Oct-2024 volatility spikes.
+    - Recalibrated thresholds (95th Percentile, EVT) increase for impacted currencies.
+    - This shows the importance of adaptive thresholds in real-time FX surveillance.
+    """)
