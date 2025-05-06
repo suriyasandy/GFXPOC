@@ -1,0 +1,13 @@
+with tab5:
+    st.header("Smile Components Visualization")
+
+    # Filter only positive values for size
+    scatter_df = df_summary[(df_summary["Smile_Threshold"] > 0)].copy()
+
+    fig = px.scatter(scatter_df, x="RR", y="BF", size="Smile_Threshold",
+                     color="Currency", title="Smile Structure (RR vs BF)")
+    st.plotly_chart(fig, use_container_width=True)
+
+    fig2 = px.bar(df_summary, x="Currency", y=["ManualThreshold", "Smile_Threshold"],
+                  barmode="group", title="Manual vs Smile Threshold")
+    st.plotly_chart(fig2, use_container_width=True)
