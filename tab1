@@ -1,0 +1,63 @@
+with tab1:
+    st.title("FX Volatility Thresholding: Manual vs Dynamic")
+
+    st.subheader("📌 Business Use Case")
+    st.markdown("""
+    In institutional FX markets, trades are monitored for **rate deviations** from market benchmarks.
+    A key component of this is **volatility thresholding**, which helps:
+    - Flag trades with excessive deviation.
+    - Ensure fairness, reduce risk, and maintain compliance.
+    """)
+
+    st.subheader("📉 Manual Approach (Baseline)")
+    st.markdown("""
+    - Currencies are bucketed into 4 fixed groups (based on average volatility).
+    - Annualized OHLC volatility from vendors like Reuters is **converted to daily** using:
+      ```
+      daily_vol = ohlc_vol / √252
+      ```
+    - Then mapped to group thresholds:
+      - Group 1: < 0.07 → Threshold = 0.10
+      - Group 2: < 0.50 → Threshold = 0.25
+      - Group 3: < 0.60 → Threshold = 0.55
+      - Group 4: ≥ 0.60 → Threshold = 0.80
+
+    **Limitation**:
+    - Thresholds are fixed and lag behind real-time volatility changes.
+    """)
+
+    st.subheader("📊 Our Dynamic Volatility Computation")
+    st.markdown("""
+    We compute volatility using **log returns of Close prices**, capturing actual price movements:
+
+    ```
+    log_return = log(Close_t / Close_t-1)
+    volatility = rolling_std(log_return) * √252
+    ```
+
+    **Example**:
+    - Close Prices: 100, 102, 101
+    - Log Return Day 2: log(102 / 100) = 0.0198
+    - Log Return Day 3: log(101 / 102) = -0.0098
+    - Rolling volatility is computed over a 60-day window and annualized.
+
+    This method:
+    - Reflects true market volatility dynamics.
+    - Enables **adaptive thresholding** using models like GARCH, EVT, and smile logic.
+    """)
+
+    st.subheader("🚀 Our Enhanced Dynamic Approach")
+    st.markdown("""
+    We simulate and compare **multiple thresholding methods**:
+    - 📈 GARCH: Captures volatility clustering.
+    - 🔺 EVT: Models extreme tail behavior.
+    - 🧠 Smile-based logic: Uses implied volatility structure (ATM, RR, BF).
+    - 🔁 Cross-pair thresholds and weekly recalibration simulation.
+
+    All methods are:
+    - Transparent & explainable.
+    - Visualized for easy comparison.
+    - Built for weekly or real-time updates.
+
+    Navigate the tabs above to explore the comparison in detail.
+    """)
