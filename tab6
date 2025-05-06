@@ -1,0 +1,105 @@
+with tab6:
+    st.header("Real-Time Recalibration Simulation")
+    sub1, sub2 = st.tabs(["Single Currency", "Cross-Currency"])
+
+    # === Common Base Data ===
+    base_df = df.copy()
+    last_date = base_df["Date"].max()
+    impacted_currencies = ["INR", "JPY", "GBP"]
+
+    with sub1:
+        st.markdown("""
+        Simulate post-Oct-2024 volatility shocks and recalibrate thresholds.
+        """)
+
+        roll_window = st.slider("Rolling Window (days)", 20, 100, ROLL_WINDOW)
+        shock_end = st.date_input("Shock End Date", value=pd.to_datetime("2024-11-01"))
+
+        shock_start = last_date + pd.Timedelta(days=1)
+        shock_dates = pd.date_range(start=shock_start, end=shock_end, freq='B')
+
+        df_test = []
+        for ccy in base_df["Currency"].unique():
+            ccy_df = base_df[base_df["Currency"] == ccy].copy()
+            last_close = ccy_df["Close"].iloc[-1]
+            for date in shock_dates:
+                shock = np.random.normal(1.03, 0.03) if ccy in impacted_currencies else 1.0
+                new_close = last_close * shock
+                ccy_df = pd.concat([ccy_df, pd.DataFrame({
+                    "Currency": [ccy],
+                    "Date": [date],
+                    "Close": [new_close],
+                    "ShockFlag": [shock]
+                })], ignore_index=True)
+                last_close = new_close
+            df_test.append(ccy_df)
+
+        df_test = pd.concat(df_test)
+        df_test.sort_values(["Currency", "Date"], inplace=True)
+        df_test["LogReturn"] = df_test.groupby("Currency")["Close"].transform(lambda x: np.log(x).diff())
+        df_test["Volatility"] = df_test.groupby("Currency")["LogReturn"].transform(lambda x: x.rolling(roll_window).std()) * ANNUALIZE
+        df_test = df_test.dropna()
+        df_test.to_csv("reuters_gfx_test_data.csv", index=False)
+
+        st.success("📁 `reuters_gfx_test_data.csv` created with simulated shock data.")
+
+        st.subheader("Recalibrated Thresholds Using Test Data")
+        dynamic_recalibrated = df_test.groupby("Currency").agg(
+            AvgVol_Shocked=("Volatility", "mean"),
+            New95thPct=("Volatility", lambda x: x.quantile(PCT_THRESHOLD)),
+            NewEVT=("Volatility", lambda x: genpareto.ppf(0.999, *genpareto.fit(x[x > x.quantile(EVT_TAIL_PCT)])))
+        ).reset_index()
+
+        merged = df_summary[["Currency", "ManualThreshold"]].merge(dynamic_recalibrated, on="Currency", how="inner")
+        st.dataframe(merged, use_container_width=True)
+
+        sel = st.selectbox("Select Currency to View Trend", merged["Currency"].unique())
+        trend = df_test[df_test["Currency"] == sel]
+        base_vol = df[df["Currency"] == sel][["Date", "Volatility"]]
+        base_vol.rename(columns={"Volatility": "OldVolatility"}, inplace=True)
+        plot_df = trend.merge(base_vol, on="Date", how="left")
+        plot_df = plot_df.merge(merged[merged["Currency"] == sel], on="Currency")
+
+        fig = px.line(plot_df, x="Date", y="Volatility", title=f"Volatility Trend (Post-Shock) - {sel}")
+        fig.add_scatter(x=plot_df["Date"], y=plot_df["OldVolatility"], mode="lines", name="Old Volatility")
+        fig.add_hline(y=plot_df["ManualThreshold"].iloc[0], line_dash="dot", annotation_text="Manual")
+        fig.add_hline(y=plot_df["New95thPct"].iloc[0], line_dash="dash", annotation_text="New 95th")
+        fig.add_hline(y=plot_df["NewEVT"].iloc[0], line_dash="solid", annotation_text="New EVT")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with sub2:
+        st.markdown("""
+        Simulate cross-currency recalibration using shocked volatilities.
+        """)
+        base_ccy = st.selectbox("Base Currency", base_df["Currency"].unique(), key="cross_base")
+        quote_ccy = st.selectbox("Quote Currency", base_df["Currency"].unique(), key="cross_quote")
+
+        base_data = df_test[df_test["Currency"] == base_ccy].copy()
+        quote_data = df_test[df_test["Currency"] == quote_ccy].copy()
+        merged_pair = pd.merge(base_data[["Date", "Close"]], quote_data[["Date", "Close"]], on="Date", suffixes=("_base", "_quote"))
+        merged_pair["Synthetic"] = merged_pair["Close_base"] / merged_pair["Close_quote"]
+        merged_pair["LogRet"] = np.log(merged_pair["Synthetic"]).diff()
+        merged_pair["Vol"] = merged_pair["LogRet"].rolling(roll_window).std() * ANNUALIZE
+        merged_pair = merged_pair.dropna()
+
+        evt_thres = genpareto.ppf(0.999, *genpareto.fit(merged_pair["Vol"][merged_pair["Vol"] > merged_pair["Vol"].quantile(EVT_TAIL_PCT)]))
+
+        base_manual = df_summary[df_summary["Currency"] == base_ccy]["ManualThreshold"].values[0]
+        quote_manual = df_summary[df_summary["Currency"] == quote_ccy]["ManualThreshold"].values[0]
+        manual_thres = max(base_manual, quote_manual)
+
+        st.subheader(f"Synthetic Pair: {base_ccy}/{quote_ccy}")
+        st.metric("Manual Threshold", f"{manual_thres:.4f}")
+        st.metric("EVT Threshold (Shocked)", f"{evt_thres:.4f}")
+
+        fig = px.line(merged_pair, x="Date", y="Vol", title=f"Synthetic Volatility: {base_ccy}/{quote_ccy}")
+        fig.add_hline(y=evt_thres, line_dash="dash", annotation_text="EVT")
+        fig.add_hline(y=manual_thres, line_dash="dot", annotation_text="Manual")
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("Insight")
+        st.markdown(f"""
+        - Cross-pair volatility computed from synthetic construction ({base_ccy}/{quote_ccy}).
+        - EVT recalibration flags potential spikes due to shocks in individual legs.
+        - Recommended to switch thresholds dynamically rather than fixed manual bounds.
+        """)
