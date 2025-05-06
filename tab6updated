@@ -1,0 +1,77 @@
+with tab6:
+    st.header("Real-Time Recalibration Simulation")
+
+    subtab1, subtab2 = st.tabs(["Recalibrated Thresholds Summary", "Currency Trend View"])
+
+    with subtab1:
+        st.markdown("""
+        This module simulates post-14 Oct 2024 FX market shocks for selected currencies and shows how dynamic models recalibrate thresholds automatically,
+        while manual thresholds remain static.
+        """)
+
+        # User inputs
+        shock_end_date = st.date_input("Select Shock End Date", pd.to_datetime("2024-11-01"))
+        roll = st.slider("Rolling Window", 10, 90, ROLL_WINDOW)
+
+        # Generate synthetic shocks
+        fx_df = df.copy()
+        impacted_ccys = ["INR", "JPY", "GBP"]
+        test_rows = []
+
+        for ccy in fx_df["Currency"].unique():
+            ccy_df = fx_df[fx_df["Currency"] == ccy].copy()
+            last_date = ccy_df["Date"].max()
+            start = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=1, freq='B')[0]
+            end = pd.to_datetime(shock_end_date)
+
+            if start >= end:
+                continue
+
+            date_range = pd.date_range(start=start, end=end, freq='B')
+            shock_factor = 1.5 if ccy in impacted_ccys else 1.0
+
+            last_close = ccy_df["Close"].iloc[-1]
+            for dt in date_range:
+                new_close = last_close * np.random.normal(loc=1.0, scale=0.01)
+                test_rows.append([ccy, dt, new_close])
+
+        test_df = pd.DataFrame(test_rows, columns=["Currency", "Date", "Close"])
+        combined = pd.concat([df[["Currency", "Date", "Close"]], test_df])
+        combined.sort_values(["Currency", "Date"], inplace=True)
+        combined["LogReturn"] = combined.groupby("Currency")["Close"].transform(lambda x: np.log(x).diff())
+        combined["Volatility"] = combined.groupby("Currency")["LogReturn"].transform(lambda x: x.rolling(roll).std()) * ANNUALIZE
+        combined.dropna(inplace=True)
+        combined.to_csv("reuters_gfx_test_data.csv", index=False)
+
+        st.success("Generated `reuters_gfx_test_data.csv` with shocked volatilities.")
+
+        # Recalculate thresholds post shock
+        post_df = combined[combined["Date"] > pd.to_datetime("2024-10-14")]
+        dynamic = post_df.groupby("Currency").agg(
+            AvgVol_Shocked=("Volatility", "mean"),
+            New95thPct=("Volatility", lambda x: x.quantile(PCT_THRESHOLD)),
+            NewEVT=("Volatility", lambda x: genpareto.ppf(0.999, *genpareto.fit(x[x > x.quantile(EVT_TAIL_PCT)])))
+        ).reset_index()
+
+        recalibrated = df_summary[["Currency", "ManualThreshold"]].merge(dynamic, on="Currency", how="inner")
+        st.subheader("Recalibrated Thresholds Using Test Data")
+        st.dataframe(recalibrated, use_container_width=True)
+
+        fig = px.bar(recalibrated.melt(id_vars="Currency", value_vars=["ManualThreshold", "New95thPct", "NewEVT"]),
+                     x="Currency", y="value", color="variable", barmode="group",
+                     title="Manual vs Recalibrated Thresholds (Post-Volatility Shock)",
+                     labels={"value": "Threshold", "variable": "Method"})
+        st.plotly_chart(fig, use_container_width=True)
+
+    with subtab2:
+        st.subheader("Trend Chart with Shock Impact")
+        ccy_choice = st.selectbox("Select Currency to View Trend", recalibrated["Currency"].unique() if not recalibrated.empty else [])
+
+        if ccy_choice:
+            plot_df = combined[combined["Currency"] == ccy_choice]
+            thresholds = recalibrated[recalibrated["Currency"] == ccy_choice]
+
+            fig = px.line(plot_df, x="Date", y="Volatility", title=f"{ccy_choice} Volatility with Shock & Thresholds")
+            fig.add_hline(y=thresholds["ManualThreshold"].values[0], line_dash="dot", annotation_text="Manual")
+            fig.add_hline(y=thresholds["New95thPct"].values[0], line_dash="dot", annotation_text="New 95th Pct")
+            fig.add_hline(y=thresholds["NewEVT"].values
