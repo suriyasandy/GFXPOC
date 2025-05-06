@@ -1,0 +1,42 @@
+# --- Tab 7: Live FX Rate Forecast and Thresholds ---
+with tab7:
+    st.header("Live FX Rate Forecast & Model Comparison")
+
+    st.markdown("""
+    This module compares **Random Forest** and **LSTM** models for FX rate forecasting.
+    The outputs help set **MAPE% thresholds** to flag trades that deviate from market expectations.
+    """)
+
+    sel_currency = st.selectbox("Select Currency Pair", df['Currency'].unique(), key="tab7_curr")
+
+    rf_mape = model_results["Random Forest"].loc[model_results["Random Forest"].Currency == sel_currency, "MAPE%"].values[0]
+    lstm_mape = model_results["LSTM"].loc[model_results["LSTM"].Currency == sel_currency, "MAPE%"].values[0]
+
+    st.subheader(f"Forecasted FX Rate: {sel_currency}")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=forecast_df["Date"], y=forecast_df[f"{sel_currency}_RF"], mode='lines+markers', name="Random Forest"))
+    fig.add_trace(go.Scatter(x=forecast_df["Date"], y=forecast_df[f"{sel_currency}_LSTM"], mode='lines+markers', name="LSTM"))
+
+    fig.update_layout(title=f"{sel_currency} Forecast (RF vs LSTM)", xaxis_title="Date", yaxis_title="Forecasted Rate")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("MAPE-Based Threshold Recommendations")
+    st.markdown(f"""
+    For **{sel_currency}**, based on model accuracy:
+
+    - **Random Forest MAPE** = `{rf_mape:.2f}%`
+    - **LSTM MAPE** = `{lstm_mape:.2f}%`
+
+    ### Deviation Threshold Rule
+    Raise an alert if:
+
+    \[ \text{{Deviation (\%)}} = \left| \frac{{\text{{Deal Rate}} - \text{{Market Rate}}}}{{\text{{Market Rate}}}} \right| \times 100 \]
+
+    - **Deviation > MAPE%** (use model-specific MAPE)
+
+    This allows a clean and explainable approach to off-market rate flagging.
+    """)
+
+    st.subheader("Performance Table")
+    st.dataframe(model_comparison_df, use_container_width=True)
