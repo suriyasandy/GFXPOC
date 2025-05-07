@@ -1,0 +1,9 @@
+        # Prophet Forecast (Univariate)
+        prophet_df = df_input[df_input["Currency"] == selected_currency][["Date", "Close"]].dropna()
+        prophet_df = prophet_df.rename(columns={"Date": "ds", "Close": "y"})
+        prophet_model = Prophet(seasonality_mode="multiplicative", daily_seasonality=True)
+        prophet_model.fit(prophet_df)
+        future_df = prophet_model.make_future_dataframe(periods=len(y_test))
+        prophet_forecast = prophet_model.predict(future_df)
+        prophet_pred = prophet_forecast["yhat"][-len(y_test):].values
+        results["Prophet"] = prophet_pred
