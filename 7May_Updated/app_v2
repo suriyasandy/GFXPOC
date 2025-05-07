@@ -62,15 +62,13 @@ def load_models(currency_name, path="models"):
         rf = joblib.load(f"{path}/rf_{currency_name}.pkl")
         svr = joblib.load(f"{path}/svr_{currency_name}.pkl")
         lr = joblib.load(f"{path}/lr_{currency_name}.pkl")
-        
-        # Load LSTM model with compile=False to avoid 'mse' resolution issue
         lstm = load_model(f"{path}/lstm_{currency_name}.h5", compile=False)
-        
         scaler = joblib.load(f"{path}/scaler_{currency_name}.pkl")
         return {"Random Forest": rf, "SVR": svr, "Linear Regression": lr, "LSTM": lstm}, scaler
     except Exception as e:
         st.warning(f"Model loading failed for {currency_name}: {e}")
         return None, None
+
 # --- Model Training and Saving ---
 def train_and_save_models(currency_name, df, save_path="models", window=30):
     os.makedirs(save_path, exist_ok=True)
@@ -116,14 +114,14 @@ def train_and_save_models(currency_name, df, save_path="models", window=30):
 # --- FX Dataset ---
 df = load_fx_data()
 
-# --- Streamlit Sidebar / Trigger ---
+# --- Sidebar UI ---
 st.sidebar.header("Train FX Forecasting Models")
-currency = st.sidebar.selectbox("Select Currency", df["Currency"].unique().tolist())
+currency_option = st.sidebar.selectbox("Select Currency", df["Currency"].unique().tolist())
 if st.sidebar.button("Train & Save Models"):
-    with st.spinner(f"Training models for {currency}..."):
-        success = train_and_save_models(currency, df)
+    with st.spinner(f"Training models for {currency_option}..."):
+        success = train_and_save_models(currency_option, df)
     if success:
-        st.sidebar.success(f"Models for {currency} saved to /models/")
+        st.sidebar.success(f"Models for {currency_option} saved to /models/")
 
 
 # Assign manual volatility group
@@ -332,11 +330,10 @@ with tab2:
 
 
 # --- Tab 3: Forecast with Dynamic Test Period ---
-# --- Tab 3: Forecast with Dynamic Test Period ---
 with tab3:
     st.header("Live FX Forecasting (Flexible Test Period)")
 
-    selected_currency = st.selectbox("Select Currency", df["Currency"].unique(), key="fx_forecast_currency")
+    selected_currency = st.selectbox("Select Currency", df["Currency"].unique(),index=None, key="fx_forecast_currency")
     test_days = st.slider("Select Test Period (days before latest date)", min_value=30, max_value=90, step=30, value=60)
 
     if selected_currency:
@@ -357,7 +354,6 @@ with tab3:
             scaled_train = scaler.transform(train_df)
             scaled_test = scaler.transform(test_df)
 
-            WINDOW = 30
             def create_sequences(data, window):
                 X, y = [], []
                 for i in range(len(data) - window):
@@ -365,6 +361,7 @@ with tab3:
                     y.append(data[i+window])
                 return np.array(X), np.array(y)
 
+            WINDOW = 30
             X_train, y_train = create_sequences(scaled_train, WINDOW)
             X_rf_test = []
             for i in range(len(test_df)):
@@ -417,26 +414,24 @@ with tab3:
                     "Test RMSE": np.sqrt(mean_squared_error(y_true_test, preds_test_inv))
                 })
 
-            manual_thresh = df_summary[df_summary["Currency"] == selected_currency]["ManualThreshold"].values[0]
-            fig.add_hline(y=manual_thresh, line_color="red", line_dash="dot", annotation_text="Manual Threshold")
-
             best_model = min(metrics, key=lambda x: x["Test MAPE"])
             model_name = best_model["Model"]
             best_mape = best_model["Test MAPE"]
 
-            # --- LOG BEST MAPE ---
+            # 🔁 Log best MAPE per currency
             log_entry = pd.DataFrame([{
                 "RunDate": pd.Timestamp.today(),
                 "Currency": selected_currency,
                 "Model": model_name,
                 "MAPE": best_mape
             }])
-            if os.path.exists("model_feedback_log.csv"):
-                existing = pd.read_csv("model_feedback_log.csv")
+            log_path = "model_feedback_log.csv"
+            if os.path.exists(log_path):
+                existing = pd.read_csv(log_path)
                 full_log = pd.concat([existing, log_entry], ignore_index=True)
             else:
                 full_log = log_entry
-            full_log.to_csv("model_feedback_log.csv", index=False)
+            full_log.to_csv(log_path, index=False)
 
             preds_inv = scaler.inverse_transform(model_outputs_test[model_name].reshape(-1, 1)).flatten()
             mape_pct = best_mape / 100
@@ -464,8 +459,6 @@ with tab3:
 
 with tab4:
     st.header("Final Thresholds & Forecast Accuracy")
-
-    # Step 1: Compute final threshold
     df_summary["FinalThreshold"] = df_summary[[ 
         "ManualThreshold", "95th_Pct", "GARCH_Forecast", "EVT_Threshold"
     ]].max(axis=1)
@@ -474,88 +467,72 @@ with tab4:
     def load_best_mape_summary():
         try:
             log_df = pd.read_csv("model_feedback_log.csv")
-
-            # Defensive fix: strip + upper-case for merge robustness
             log_df["Currency"] = log_df["Currency"].str.strip().str.upper()
             df_summary["Currency"] = df_summary["Currency"].str.strip().str.upper()
 
-            latest = log_df.sort_values("RunDate", ascending=False).drop_duplicates(subset=["Currency", "Model"])
-            best_mape = latest.groupby("Currency")["MAPE"].min().reset_index()
-            best_mape.rename(columns={"MAPE": "Best_MAPE"}, inplace=True)
-
+            latest = log_df.sort_values("RunDate", ascending=False).drop_duplicates(subset=["Currency"])
+            print(latest)
+            best_mape = latest[["Currency", "MAPE"]].rename(columns={"MAPE": "Best_MAPE"})
+            print(best_mape)
             return best_mape
         except Exception as e:
-            st.error(f"Error loading MAPE summary: {e}")
+            st.error(f"Error loading MAPE log: {e}")
             return pd.DataFrame(columns=["Currency", "Best_MAPE"])
 
     best_mape_df = load_best_mape_summary()
-
-    # Debugging logs
-    st.write("🔍 MAPE Log Summary (Top 5):", best_mape_df.head())
-    st.write("🔍 df_summary Preview (Top 5):", df_summary.head())
-
-    # Step 2: Merge and select
     df_final = df_summary.merge(best_mape_df, on="Currency", how="left")
-    st.write("✅ Merged DataFrame Preview:", df_final.head())
 
-    selected_currency = st.selectbox("Select Currency", df_final["Currency"], key="tab4_currency")
+    selected_currency = st.selectbox("Select Currency", df_final["Currency"],index=None, key="tab4_currency")
+    if selected_currency:
+        row = df_final[df_final["Currency"] == selected_currency].iloc[0]
 
-    row = df_final[df_final["Currency"] == selected_currency].iloc[0]
+        st.subheader(f"{selected_currency}: Thresholds & Justification")
+        st.markdown(f"""
+        - **Avg Log-Return Volatility** (Dynamic): `{round(row['AvgVol'], 4)}`
+        - **Avg OHLC Realized Volatility** (Manual): `{round(row['AvgRealizedVol'], 4)}`
+        - **Manual Group (based on OHLC)**: `{row['ManualGroup']}`
+        - **Manual Threshold**: `{round(row['ManualThreshold'], 4)}`
+        - **Final Dynamic Threshold**: `{round(row['FinalThreshold'], 4)}`
+        - **Best Model MAPE**: `{round(row['Best_MAPE'], 2) if pd.notnull(row['Best_MAPE']) else 'NA'}%`
+        """)
 
-    st.subheader(f"{selected_currency}: Thresholds & Justification")
-    st.markdown(f"""
-    - **Avg Log-Return Volatility** (Dynamic): `{round(row['AvgVol'], 4)}`
-    - **Avg OHLC Realized Volatility** (Manual): `{round(row['AvgRealizedVol'], 4)}`
-    - **Manual Group (based on OHLC)**: `{row['ManualGroup']}`
-    - **Manual Threshold**: `{round(row['ManualThreshold'], 4)}`
-    - **Final Dynamic Threshold** (Max of Models): `{round(row['FinalThreshold'], 4)}`
-    - **Best Model MAPE**: `{round(row['Best_MAPE'], 2) if pd.notnull(row['Best_MAPE']) else 'NA'}%`
-    """)
+        # Chart: Manual vs Final vs MAPE
+        fig = go.Figure()
+        fig.add_trace(go.Bar(name="Manual", x=[selected_currency], y=[row["ManualThreshold"]]))
+        fig.add_trace(go.Bar(name="Final Dynamic", x=[selected_currency], y=[row["FinalThreshold"]]))
+        if pd.notnull(row["Best_MAPE"]):
+            fig.add_trace(go.Bar(name="Best MAPE", x=[selected_currency], y=[row["Best_MAPE"] / 100]))
+        fig.update_layout(title="Threshold Comparison", barmode="group")
+        st.plotly_chart(fig, use_container_width=True)
 
-    # Bar Plot
-    fig = go.Figure()
-    fig.add_trace(go.Bar(name="Manual", x=[selected_currency], y=[row["ManualThreshold"]]))
-    fig.add_trace(go.Bar(name="Final Dynamic", x=[selected_currency], y=[row["FinalThreshold"]]))
-    if pd.notnull(row["Best_MAPE"]):
-        fig.add_trace(go.Bar(name="Best Model MAPE", x=[selected_currency], y=[row["Best_MAPE"] / 100]))
+        # Volatility Band Plot
+        st.subheader("Historical Volatility Trend & Breach Flags")
+        trend_df = df[df["Currency"] == selected_currency].copy()
+        trend_df = trend_df.sort_values("Date")
+        y_actual = trend_df["Volatility"].values
+        dates = trend_df["Date"]
+        mape_pct = row["Best_MAPE"] / 100 if pd.notnull(row["Best_MAPE"]) else 0.05
 
-    fig.update_layout(title="Threshold Comparison", barmode="group")
-    st.plotly_chart(fig, use_container_width=True)
+        upper_band = y_actual * (1 + mape_pct)
+        lower_band = y_actual * (1 - mape_pct)
+        flag_mask = (y_actual > upper_band) | (y_actual < lower_band)
 
-    # Volatility Trend
-    st.subheader("Historical Volatility Trend & Breach Flags")
-    trend_df = df[df["Currency"] == selected_currency].copy()
-    trend_df = trend_df.sort_values("Date")
-    y_actual = trend_df["Volatility"].values
-    dates = trend_df["Date"]
+        fig_vol = go.Figure()
+        fig_vol.add_trace(go.Scatter(x=dates, y=y_actual, name="Actual Volatility"))
+        fig_vol.add_trace(go.Scatter(x=dates, y=upper_band, name="Dynamic Upper", line=dict(dash="dot")))
+        fig_vol.add_trace(go.Scatter(x=dates, y=lower_band, name="Dynamic Lower", line=dict(dash="dot")))
+        fig_vol.add_hline(y=row["ManualThreshold"], line_color="red", line_dash="dot", annotation_text="Manual")
+        fig_vol.add_hline(y=row["FinalThreshold"], line_color="orange", line_dash="dash", annotation_text="Dynamic")
+        fig_vol.add_trace(go.Scatter(
+            x=dates[flag_mask],
+            y=y_actual[flag_mask],
+            mode="markers",
+            name="Deviations",
+            marker=dict(color="red", symbol="x")
+        ))
+        fig_vol.update_layout(title=f"{selected_currency}: Volatility vs Thresholds", xaxis_title="Date", yaxis_title="Volatility")
+        st.plotly_chart(fig_vol, use_container_width=True)
 
-    mape_pct = row["Best_MAPE"] / 100 if pd.notnull(row["Best_MAPE"]) else 0.05  # fallback 5%
-
-    upper_band = y_actual * (1 + mape_pct)
-    lower_band = y_actual * (1 - mape_pct)
-    flag_mask = (y_actual > upper_band) | (y_actual < lower_band)
-
-    fig_vol = go.Figure()
-    fig_vol.add_trace(go.Scatter(x=dates, y=y_actual, name="Actual Volatility", line=dict(color="white")))
-    fig_vol.add_trace(go.Scatter(x=dates, y=upper_band, name="Dynamic Upper", line=dict(dash="dot", color="green")))
-    fig_vol.add_trace(go.Scatter(x=dates, y=lower_band, name="Dynamic Lower", line=dict(dash="dot", color="green")))
-    fig_vol.add_hline(y=row["ManualThreshold"], line_color="red", line_dash="dot", annotation_text="Manual")
-    fig_vol.add_hline(y=row["FinalThreshold"], line_color="orange", line_dash="dash", annotation_text="Final Dynamic")
-
-    fig_vol.add_trace(go.Scatter(
-        x=dates[flag_mask],
-        y=y_actual[flag_mask],
-        mode="markers",
-        name="Flagged Deviations",
-        marker=dict(color="red", size=8, symbol="x")
-    ))
-
-    fig_vol.update_layout(
-        title=f"{selected_currency}: Volatility with Manual, Dynamic Thresholds & Flags",
-        xaxis_title="Date",
-        yaxis_title="Annualized Volatility"
-    )
-    st.plotly_chart(fig_vol, use_container_width=True)
 
 
 # --- Tab 5: Cross-Currency Threshold Estimation ---
@@ -563,37 +540,60 @@ with tab5:
     st.header("Cross-Currency Thresholds (Synthetic)")
 
     st.markdown("""
-    This module calculates cross-currency thresholds (e.g., INRJPY) using their USD legs (e.g., INRUSD + USDJPY).
+    This module calculates cross-currency thresholds (e.g., AUDCZK = AUDUSD × USDCZK) using historical data.
+    - Dynamic threshold = 95th percentile of synthetic volatility.
+    - Manual threshold = max(manual thresholds of base and quote legs).
+    - Regime flags and threshold breaches shown below.
     """)
 
-    cross_pairs = [("INRJPY", "INR", "JPY"), ("GBPJPY", "GBP", "JPY"), ("EURINR", "EUR", "INR")]
+    currencies = df["Currency"].unique().tolist()
+    cross_pairs = [(f"{b}{q}", b, q) for b in currencies for q in currencies if b != q]
     pair_labels = [f"{p[0]} = {p[1]}USD × USD{p[2]}" for p in cross_pairs]
     pair_choice = st.selectbox("Select Cross Pair", pair_labels)
 
     selected_pair = cross_pairs[pair_labels.index(pair_choice)]
     pair_name, base_ccy, quote_ccy = selected_pair
 
-    base_df = df[df["Currency"] == base_ccy][["Date", "Close", "Volatility"]].copy()
-    quote_df = df[df["Currency"] == quote_ccy][["Date", "Close", "Volatility"]].copy()
-    merged = pd.merge(base_df, quote_df, on="Date", suffixes=(f"_{base_ccy}", f"_{quote_ccy}")).dropna()
+    try:
+        base_df = df[df["Currency"] == base_ccy][["Date", "Close"]].copy()
+        quote_df = df[df["Currency"] == quote_ccy][["Date", "Close"]].copy()
 
-    merged["SyntheticRate"] = merged[f"Close_{base_ccy}"] / merged[f"Close_{quote_ccy}"]
-    merged["LogReturn"] = np.log(merged["SyntheticRate"]).diff()
-    merged["CrossVolatility"] = merged["LogReturn"].rolling(ROLL_WINDOW).std() * ANNUALIZE
-    merged.dropna(inplace=True)
+        merged = pd.merge(base_df, quote_df, on="Date", suffixes=(f"_{base_ccy}", f"_{quote_ccy}")).dropna()
+        merged["SyntheticRate"] = merged[f"Close_{base_ccy}"] / merged[f"Close_{quote_ccy}"]
+        merged["LogReturn"] = np.log(merged["SyntheticRate"]).diff()
+        merged["CrossVolatility"] = merged["LogReturn"].rolling(ROLL_WINDOW).std() * ANNUALIZE
+        merged.dropna(inplace=True)
 
-    df_thresh = df_summary.set_index("Currency")
-    manual_cross = max(df_thresh.loc[base_ccy, "ManualThreshold"], df_thresh.loc[quote_ccy, "ManualThreshold"])
-    dynamic_cross = max(df_thresh.loc[base_ccy, "FinalThreshold"], df_thresh.loc[quote_ccy, "FinalThreshold"])
+        df_thresh = df_summary.set_index("Currency")
+        manual_cross = max(df_thresh.loc[base_ccy, "ManualThreshold"], df_thresh.loc[quote_ccy, "ManualThreshold"])
+        dynamic_cross = merged["CrossVolatility"].quantile(PCT_THRESHOLD)
 
-    st.subheader(f"{pair_name} Thresholds")
-    st.markdown(f"""
-    - **Cross Volatility Range**: `{merged['CrossVolatility'].min():.4f}` to `{merged['CrossVolatility'].max():.4f}`
-    - **Manual Cross Threshold**: `{manual_cross:.4f}`
-    - **Final Dynamic Threshold (max of legs)**: `{dynamic_cross:.4f}`
-    """)
+        # Breach flags
+        merged["Flag"] = merged["CrossVolatility"] > dynamic_cross
 
-    fig = px.line(merged, x="Date", y="CrossVolatility", title=f"{pair_name} Volatility (Synthetic)")
-    fig.add_hline(y=manual_cross, line_color="red", line_dash="dot", annotation_text="Manual")
-    fig.add_hline(y=dynamic_cross, line_color="green", line_dash="dash", annotation_text="Dynamic")
-    st.plotly_chart(fig, use_container_width=True)
+        # Plot
+        st.subheader(f"{pair_name} Thresholds")
+        st.markdown(f"""
+        - **Cross Volatility Range**: `{merged['CrossVolatility'].min():.4f}` to `{merged['CrossVolatility'].max():.4f}`
+        - **Manual Cross Threshold**: `{manual_cross:.4f}`
+        - **Dynamic Cross Threshold (95th pct)**: `{dynamic_cross:.4f}`
+        """)
+
+        fig = px.line(merged, x="Date", y="CrossVolatility", title=f"{pair_name} Volatility (Synthetic)")
+        fig.add_hline(y=manual_cross, line_color="red", line_dash="dot", annotation_text="Manual")
+        fig.add_hline(y=dynamic_cross, line_color="green", line_dash="dash", annotation_text="Dynamic")
+
+        # Add breach flags
+        breach_points = merged[merged["Flag"] == True]
+        fig.add_trace(go.Scatter(
+            x=breach_points["Date"],
+            y=breach_points["CrossVolatility"],
+            mode="markers",
+            name="Threshold Breach",
+            marker=dict(color="orange", size=10, symbol="x")
+        ))
+
+        st.plotly_chart(fig, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"Failed to compute synthetic cross pair volatility: {e}")
