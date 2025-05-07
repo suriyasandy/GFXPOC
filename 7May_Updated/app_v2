@@ -250,49 +250,67 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "Final Results & Recommendation", "Cross-Currency View"
 ])
 
-# --- Tab 1: Overview ---
 with tab1:
-    st.title("FX Volatility Thresholding: Manual vs Dynamic")
+    st.title("FX Volatility Thresholding: Manual vs. Dynamic ML Approach")
 
-    st.subheader("Business Use Case")
+    st.subheader(" Why Monitor Volatility Thresholds in FX Trading?")
     st.markdown("""
-    In institutional FX markets, trades are monitored for **rate deviations** from market benchmarks.
-    A key component of this is **volatility thresholding**, which helps:
-    - Flag trades with excessive deviation.
-    - Ensure fairness, reduce risk, and maintain compliance.
+    In institutional FX markets, every trade is subject to pricing scrutiny. To flag **potentially off-market trades**, teams use volatility-based thresholds.
 
-    Currently, operations teams use **static thresholds** per currency, based on manual grouping logic.
-    But these thresholds:
-    - Don’t adapt to changing market conditions.
-    - Fail to account for structural behaviors like **volatility clustering** or **option smiles**.
+    These thresholds define what is **acceptable deviation** from a benchmark market rate.
+
+    **Key users:**
+    - **Operations teams**: Auto-flag deviations for review
+    - **Compliance**: Ensure fair pricing and regulatory defensibility
+    - **Quants**: Monitor market regime changes or anomalies
     """)
 
-    st.subheader("Manual Approach (Baseline)")
+    st.subheader(" Manual Thresholding: The Current Baseline")
     st.markdown("""
-    - Currencies are bucketed into 4 fixed groups (based on average volatility ranges).
-    - Each group has a fixed threshold (e.g., 0.10, 0.25...).
-    - These thresholds are static and reviewed annually or post-incident.
+    The existing operations process applies **fixed volatility thresholds** per currency using the following logic:
+    - Calculate average *OHLC-based volatility*
+    - Bucket currencies into **4 static groups**
+        - Group 1: 0.00–0.07 → Threshold = 0.10  
+        - Group 2: 0.07–0.50 → Threshold = 0.25  
+        - Group 3: 0.50–0.60 → Threshold = 0.55  
+        - Group 4: >0.60 → Threshold = 0.80  
+    - Thresholds are **revised manually every few quarters** or post-audit
 
-    **Limitations**:
-    - Outdated during regime shifts.
-    - Not tailored to individual currency behavior.
-    - No support for cross-currency or structural features like skew or RR/BF.
+    **Problems with this approach:**
+    -  Thresholds don't adapt to **market regime shifts**
+    -  Doesn't capture volatility **clustering**, **tail risk**, or **skew**
+    -  No visibility into **statistical confidence** or **model-based forecasting**
+    -  Limited defensibility in regulatory or audit scenarios
     """)
 
-    st.subheader("Our Dynamic Approach")
+    st.subheader(" Our Solution: Dynamic, Model-Aware, Explainable Thresholds")
     st.markdown("""
-    We simulate and compare **multiple thresholding methods**:
-    - GARCH: Captures volatility clustering.
-    - EVT: Captures extreme tail risks.
-    - Rolling statistics & 95th percentile comparisons.
+    We combine **multiple statistical and machine learning techniques** to calculate per-currency volatility thresholds weekly:
 
-    All results are:
-    - Transparent & visual.
-    - Easy to interpret.
-    - Designed for **weekly recalibration** instead of static thresholds.
+    **Statistical Models:**
+    - **GARCH**: Captures volatility clustering and persistence
+    - **EVT (Extreme Value Theory)**: Quantifies tail risk in extreme deviations
+    - **Rolling 95th percentile**: Baseline statistical threshold
+
+    **Machine Learning Models:**
+    - Trained per currency (e.g., INR, JPY) using LSTM, Random Forest, SVR
+    - Computes **forecast error bands** to identify probable breaches
+    - Tracks **MAPE** to dynamically adjust thresholds based on prediction reliability
+
+    **Final Threshold Decision**:
+    - Take the **maximum** of GARCH, EVT, 95th percentile
+    - Overlay **forecast confidence bands**
+    - Compare with manual thresholds for justification
+
+    **Business Benefits**:
+    -  **Explains every alert** (e.g., "flagged due to LSTM band breach + high EVT tail risk")
+    -  **Weekly recalibration** supports real-time regimes
+    -  Builds **trust** through transparency (flags justified with data)
+    -  Aligns Ops + Quants + Compliance under a unified model
     """)
 
-    st.success("Use the tabs above to compare manual thresholds with smarter, data-driven models!")
+    st.success("👉 Use the tabs above to explore how thresholds are computed, visualized, and compared across currencies and methods.")
+
 
 # --- Tab 2: Threshold Comparison ---
 with tab2:
