@@ -1,0 +1,30 @@
+# --- New Tab 5: Stationarity & Decomposition ---
+tab5 = st.tabs(["Stationarity & Decomposition"])[0]
+
+with tab5:
+    st.header("Stationarity Checks & Seasonality Insights")
+
+    selected_currency_tab5 = st.selectbox("Select Currency", df["Currency"].unique(), key="stat_tab_ccy")
+    currency_data = df[df["Currency"] == selected_currency_tab5].copy()
+
+    st.subheader("ADF Stationarity Test Result")
+    adf_result = adf_stationarity_test(currency_data["Close"])
+    st.write({
+        "ADF Statistic": round(adf_result["ADF Statistic"], 4),
+        "p-value": round(adf_result["p-value"], 6),
+        "Is Stationary?": "Yes" if adf_result["IsStationary"] else "No"
+    })
+
+    if not adf_result["IsStationary"]:
+        st.warning("This time series is **non-stationary**. Log-differencing may be required for model training.")
+
+    st.subheader("Seasonal Decomposition (Weekly Resampled)")
+    seasonal_decomposition_plot(df, selected_currency_tab5)
+
+    st.subheader("Prophet Forecast Options")
+    forecast_type = st.radio("Select Forecast Type", ["Univariate (Close)", "Multivariate (High, Low, Close)"])
+
+    if forecast_type == "Univariate (Close)":
+        forecast = prophet_univariate_forecast(df, selected_currency_tab5)
+    else:
+        forecast = prophet_multivariate_forecast(df, selected_currency_tab5)
