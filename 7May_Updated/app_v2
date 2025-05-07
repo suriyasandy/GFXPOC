@@ -254,132 +254,126 @@ with tab2:
     """)
 
 
+# --- Tab 3: Forecast with Dynamic Test Period ---
 with tab3:
-    st.header("Live FX Forecasting (Train: Jan–Aug, Test: Sep–Oct 2024)")
+    st.header("Live FX Forecasting (Flexible Test Period)")
 
     selected_currency = st.selectbox("Select Currency", df["Currency"].unique(), key="fx_forecast_currency")
+    test_days = st.slider("Select Test Period (days before latest date)", min_value=30, max_value=90, step=30, value=60)
+
     if selected_currency:
         df_ccy = df[df["Currency"] == selected_currency][["Date", "Close"]].dropna().copy()
         df_ccy["Date"] = pd.to_datetime(df_ccy["Date"])
         df_ccy.set_index("Date", inplace=True)
 
-        # Split into Train and Test
-        train_df = df_ccy[df_ccy.index < "2024-09-01"]
-        test_df = df_ccy[df_ccy.index >= "2024-09-01"]
+        latest_date = df_ccy.index.max()
+        test_start = latest_date - pd.Timedelta(days=test_days)
+        train_df = df_ccy[df_ccy.index < test_start]
+        test_df = df_ccy[df_ccy.index >= test_start]
 
-        scaler = MinMaxScaler()
-        scaled_all = scaler.fit_transform(df_ccy)
-        scaled_train = scaler.transform(train_df)
-        scaled_test = scaler.transform(test_df)
+        if train_df.empty or test_df.empty:
+            st.error("Not enough data for selected test period. Please adjust the test days slider.")
+        else:
+            scaler = MinMaxScaler()
+            scaled_all = scaler.fit_transform(df_ccy)
+            scaled_train = scaler.transform(train_df)
+            scaled_test = scaler.transform(test_df)
 
-        # --- Sequence Generator ---
-        def create_sequences(data, window):
-            X, y = [], []
-            for i in range(len(data) - window):
-                X.append(data[i:i+window])
-                y.append(data[i+window])
-            return np.array(X), np.array(y)
+            def create_sequences(data, window):
+                X, y = [], []
+                for i in range(len(data) - window):
+                    X.append(data[i:i+window])
+                    y.append(data[i+window])
+                return np.array(X), np.array(y)
 
-        WINDOW = 30
-        X_train, y_train = create_sequences(scaled_train, WINDOW)
-        X_train_rf = X_train.reshape(X_train.shape[0], -1)
-        X_train_lstm = X_train.reshape(X_train.shape[0], X_train.shape[1], 1)
+            WINDOW = 30
+            X_train, y_train = create_sequences(scaled_train, WINDOW)
+            X_train_rf = X_train.reshape(X_train.shape[0], -1)
+            X_train_lstm = X_train.reshape(X_train.shape[0], X_train.shape[1], 1)
 
-        # Generate test windows from end of train + test
-        X_rf_test = []
-        for i in range(len(test_df)):
-            X_rf_test.append(scaled_all[-(len(test_df) + WINDOW - i):-len(test_df) + i])
-        X_rf_test = np.array(X_rf_test).reshape(len(X_rf_test), -1)
-        X_lstm_test = np.array([x.reshape(WINDOW, 1) for x in X_rf_test])
+            X_rf_test = []
+            for i in range(len(test_df)):
+                X_rf_test.append(scaled_all[-(len(test_df) + WINDOW - i):-len(test_df) + i])
+            X_rf_test = np.array(X_rf_test).reshape(len(X_rf_test), -1)
+            X_lstm_test = np.array([x.reshape(WINDOW, 1) for x in X_rf_test])
 
-        # --- Model Training ---
-        model_outputs_train, model_outputs_test = {}, {}
+            model_outputs_train, model_outputs_test = {}, {}
 
-        # RF
-        rf = RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42)
-        rf.fit(X_train_rf, y_train.ravel())
-        model_outputs_train["Random Forest"] = rf.predict(X_train_rf)
-        model_outputs_test["Random Forest"] = rf.predict(X_rf_test)
+            rf = RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42)
+            rf.fit(X_train_rf, y_train.ravel())
+            model_outputs_train["Random Forest"] = rf.predict(X_train_rf)
+            model_outputs_test["Random Forest"] = rf.predict(X_rf_test)
 
-        # LSTM
-        lstm = Sequential()
-        lstm.add(LSTM(64, input_shape=(WINDOW, 1)))
-        lstm.add(Dropout(0.2))
-        lstm.add(Dense(1))
-        lstm.compile(optimizer="adam", loss="mse")
-        lstm.fit(X_train_lstm, y_train, epochs=20, batch_size=16, verbose=0)
-        model_outputs_train["LSTM"] = lstm.predict(X_train_lstm).ravel()
-        model_outputs_test["LSTM"] = lstm.predict(X_lstm_test).ravel()
+            lstm = Sequential()
+            lstm.add(LSTM(64, input_shape=(WINDOW, 1)))
+            lstm.add(Dropout(0.2))
+            lstm.add(Dense(1))
+            lstm.compile(optimizer="adam", loss="mse")
+            lstm.fit(X_train_lstm, y_train, epochs=20, batch_size=16, verbose=0)
+            model_outputs_train["LSTM"] = lstm.predict(X_train_lstm).ravel()
+            model_outputs_test["LSTM"] = lstm.predict(X_lstm_test).ravel()
 
-        # Linear Regression
-        lr = LinearRegression()
-        lr.fit(X_train_rf, y_train)
-        model_outputs_train["Linear Regression"] = lr.predict(X_train_rf)
-        model_outputs_test["Linear Regression"] = lr.predict(X_rf_test)
+            lr = LinearRegression()
+            lr.fit(X_train_rf, y_train)
+            model_outputs_train["Linear Regression"] = lr.predict(X_train_rf)
+            model_outputs_test["Linear Regression"] = lr.predict(X_rf_test)
 
-        y_true_train = scaler.inverse_transform(y_train.reshape(-1, 1)).flatten()
-        y_true_test = test_df["Close"].values
+            y_true_train = scaler.inverse_transform(y_train.reshape(-1, 1)).flatten()
+            y_true_test = test_df["Close"].values
 
-        # --- Plot Train + Test Predictions ---
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=train_df.index[-len(y_true_train):], y=y_true_train, name="Actual (Train)", line=dict(color="white")))
-        fig.add_trace(go.Scatter(x=test_df.index, y=y_true_test, name="Actual (Test)", line=dict(color="white", dash="dot")))
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=train_df.index[-len(y_true_train):], y=y_true_train, name="Actual (Train)", line=dict(color="white")))
+            fig.add_trace(go.Scatter(x=test_df.index, y=y_true_test, name="Actual (Test)", line=dict(color="white", dash="dot")))
 
-        metrics = []
-        for model, preds_train in model_outputs_train.items():
-            preds_train_inv = scaler.inverse_transform(preds_train.reshape(-1, 1)).flatten()
-            preds_test_inv = scaler.inverse_transform(model_outputs_test[model].reshape(-1, 1)).flatten()
+            metrics = []
+            for model, preds_train in model_outputs_train.items():
+                preds_train_inv = scaler.inverse_transform(preds_train.reshape(-1, 1)).flatten()
+                preds_test_inv = scaler.inverse_transform(model_outputs_test[model].reshape(-1, 1)).flatten()
 
-            # Add to chart
-            fig.add_trace(go.Scatter(x=train_df.index[-len(y_true_train):], y=preds_train_inv, name=f"{model} (Train)", line=dict(dash="dash")))
-            fig.add_trace(go.Scatter(x=test_df.index, y=preds_test_inv, name=f"{model} (Test)", line=dict(dash="solid")))
+                fig.add_trace(go.Scatter(x=train_df.index[-len(y_true_train):], y=preds_train_inv, name=f"{model} (Train)", line=dict(dash="dash")))
+                fig.add_trace(go.Scatter(x=test_df.index, y=preds_test_inv, name=f"{model} (Test)", line=dict(dash="solid")))
 
-            metrics.append({
-                "Model": model,
-                "Train MAPE": mean_absolute_percentage_error(y_true_train, preds_train_inv) * 100,
-                "Test MAPE": mean_absolute_percentage_error(y_true_test, preds_test_inv) * 100,
-                "Train RMSE": np.sqrt(mean_squared_error(y_true_train, preds_train_inv)),
-                "Test RMSE": np.sqrt(mean_squared_error(y_true_test, preds_test_inv))
-            })
+                metrics.append({
+                    "Model": model,
+                    "Train MAPE": mean_absolute_percentage_error(y_true_train, preds_train_inv) * 100,
+                    "Test MAPE": mean_absolute_percentage_error(y_true_test, preds_test_inv) * 100,
+                    "Train RMSE": np.sqrt(mean_squared_error(y_true_train, preds_train_inv)),
+                    "Test RMSE": np.sqrt(mean_squared_error(y_true_test, preds_test_inv))
+                })
 
-        # Overlay manual threshold for reference
-        manual_thresh = df_summary[df_summary["Currency"] == selected_currency]["ManualThreshold"].values[0]
-        fig.add_hline(y=manual_thresh, line_color="red", line_dash="dot", annotation_text="Manual Threshold")
+            manual_thresh = df_summary[df_summary["Currency"] == selected_currency]["ManualThreshold"].values[0]
+            fig.add_hline(y=manual_thresh, line_color="red", line_dash="dot", annotation_text="Manual Threshold")
 
-        # Derive dynamic bounds
-        best_model = min(metrics, key=lambda x: x["Test MAPE"])
-        model_name = best_model["Model"]
-        preds_inv = scaler.inverse_transform(
-            model_outputs_test[model_name].reshape(-1, 1)
-        ).flatten()
-        mape_pct = best_model["Test MAPE"] / 100
+            best_model = min(metrics, key=lambda x: x["Test MAPE"])
+            model_name = best_model["Model"]
+            preds_inv = scaler.inverse_transform(
+                model_outputs_test[model_name].reshape(-1, 1)
+            ).flatten()
+            mape_pct = best_model["Test MAPE"] / 100
 
-        upper_bound = preds_inv * (1 + mape_pct)
-        lower_bound = preds_inv * (1 - mape_pct)
+            upper_bound = preds_inv * (1 + mape_pct)
+            lower_bound = preds_inv * (1 - mape_pct)
 
-        # Identify flags
-        flag_mask = (y_true_test > upper_bound) | (y_true_test < lower_bound)
+            flag_mask = (y_true_test > upper_bound) | (y_true_test < lower_bound)
 
-        fig.add_trace(go.Scatter(x=test_df.index, y=upper_bound, name="Dynamic Upper", line=dict(dash="dot", color="green")))
-        fig.add_trace(go.Scatter(x=test_df.index, y=lower_bound, name="Dynamic Lower", line=dict(dash="dot", color="green")))
+            fig.add_trace(go.Scatter(x=test_df.index, y=upper_bound, name="Dynamic Upper", line=dict(dash="dot", color="green")))
+            fig.add_trace(go.Scatter(x=test_df.index, y=lower_bound, name="Dynamic Lower", line=dict(dash="dot", color="green")))
 
-        # Plot flagged points as red markers
-        fig.add_trace(go.Scatter(
-            x=test_df.index[flag_mask],
-            y=y_true_test[flag_mask],
-            mode="markers",
-            name="Flagged Deviations",
-            marker=dict(color="red", size=10, symbol="x")
-        ))
+            fig.add_trace(go.Scatter(
+                x=test_df.index[flag_mask],
+                y=y_true_test[flag_mask],
+                mode="markers",
+                name="Flagged Deviations",
+                marker=dict(color="red", size=10, symbol="x")
+            ))
 
-        fig.add_hline(y=manual_thresh, line_color="red", line_dash="dot", annotation_text="Manual Threshold")
+            fig.update_layout(
+                title=f"{selected_currency}: Forecast vs Thresholds ({model_name})",
+                xaxis_title="Date",
+                yaxis_title="FX Rate"
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
-        fig.update_layout(
-            title=f"{selected_currency}: Forecast vs Thresholds ({model_name})",
-            xaxis_title="Date",
-            yaxis_title="FX Rate"
-        )
-        st.plotly_chart(fig, use_container_width=True)
 
 
 with tab4:
