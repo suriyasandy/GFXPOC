@@ -465,7 +465,8 @@ with tab3:
 with tab4:
     st.header("Final Thresholds & Forecast Accuracy")
 
-    df_summary["FinalThreshold"] = df_summary[[
+    # Step 1: Compute final threshold
+    df_summary["FinalThreshold"] = df_summary[[ 
         "ManualThreshold", "95th_Pct", "GARCH_Forecast", "EVT_Threshold"
     ]].max(axis=1)
 
@@ -473,17 +474,32 @@ with tab4:
     def load_best_mape_summary():
         try:
             log_df = pd.read_csv("model_feedback_log.csv")
+
+            # Defensive fix: strip + upper-case for merge robustness
+            log_df["Currency"] = log_df["Currency"].str.strip().str.upper()
+            df_summary["Currency"] = df_summary["Currency"].str.strip().str.upper()
+
             latest = log_df.sort_values("RunDate", ascending=False).drop_duplicates(subset=["Currency", "Model"])
             best_mape = latest.groupby("Currency")["MAPE"].min().reset_index()
             best_mape.rename(columns={"MAPE": "Best_MAPE"}, inplace=True)
+
             return best_mape
-        except:
+        except Exception as e:
+            st.error(f"Error loading MAPE summary: {e}")
             return pd.DataFrame(columns=["Currency", "Best_MAPE"])
 
     best_mape_df = load_best_mape_summary()
+
+    # Debugging logs
+    st.write("🔍 MAPE Log Summary (Top 5):", best_mape_df.head())
+    st.write("🔍 df_summary Preview (Top 5):", df_summary.head())
+
+    # Step 2: Merge and select
     df_final = df_summary.merge(best_mape_df, on="Currency", how="left")
+    st.write("✅ Merged DataFrame Preview:", df_final.head())
 
     selected_currency = st.selectbox("Select Currency", df_final["Currency"], key="tab4_currency")
+
     row = df_final[df_final["Currency"] == selected_currency].iloc[0]
 
     st.subheader(f"{selected_currency}: Thresholds & Justification")
@@ -493,22 +509,27 @@ with tab4:
     - **Manual Group (based on OHLC)**: `{row['ManualGroup']}`
     - **Manual Threshold**: `{round(row['ManualThreshold'], 4)}`
     - **Final Dynamic Threshold** (Max of Models): `{round(row['FinalThreshold'], 4)}`
-    - **Best Model MAPE**: `{round(row['Best_MAPE'], 2)}%`""" if pd.notnull(row['Best_MAPE']) else "Best Model MAPE: Not Available")
+    - **Best Model MAPE**: `{round(row['Best_MAPE'], 2) if pd.notnull(row['Best_MAPE']) else 'NA'}%`
+    """)
 
+    # Bar Plot
     fig = go.Figure()
     fig.add_trace(go.Bar(name="Manual", x=[selected_currency], y=[row["ManualThreshold"]]))
     fig.add_trace(go.Bar(name="Final Dynamic", x=[selected_currency], y=[row["FinalThreshold"]]))
     if pd.notnull(row["Best_MAPE"]):
         fig.add_trace(go.Bar(name="Best Model MAPE", x=[selected_currency], y=[row["Best_MAPE"] / 100]))
+
     fig.update_layout(title="Threshold Comparison", barmode="group")
     st.plotly_chart(fig, use_container_width=True)
 
+    # Volatility Trend
     st.subheader("Historical Volatility Trend & Breach Flags")
-    trend_df = df[df["Currency"] == selected_currency].copy().sort_values("Date")
+    trend_df = df[df["Currency"] == selected_currency].copy()
+    trend_df = trend_df.sort_values("Date")
     y_actual = trend_df["Volatility"].values
     dates = trend_df["Date"]
-    best_mape = row["Best_MAPE"] or 0
-    mape_pct = best_mape / 100
+
+    mape_pct = row["Best_MAPE"] / 100 if pd.notnull(row["Best_MAPE"]) else 0.05  # fallback 5%
 
     upper_band = y_actual * (1 + mape_pct)
     lower_band = y_actual * (1 - mape_pct)
@@ -520,6 +541,7 @@ with tab4:
     fig_vol.add_trace(go.Scatter(x=dates, y=lower_band, name="Dynamic Lower", line=dict(dash="dot", color="green")))
     fig_vol.add_hline(y=row["ManualThreshold"], line_color="red", line_dash="dot", annotation_text="Manual")
     fig_vol.add_hline(y=row["FinalThreshold"], line_color="orange", line_dash="dash", annotation_text="Final Dynamic")
+
     fig_vol.add_trace(go.Scatter(
         x=dates[flag_mask],
         y=y_actual[flag_mask],
@@ -527,13 +549,13 @@ with tab4:
         name="Flagged Deviations",
         marker=dict(color="red", size=8, symbol="x")
     ))
+
     fig_vol.update_layout(
         title=f"{selected_currency}: Volatility with Manual, Dynamic Thresholds & Flags",
         xaxis_title="Date",
         yaxis_title="Annualized Volatility"
     )
     st.plotly_chart(fig_vol, use_container_width=True)
-
 
 
 # --- Tab 5: Cross-Currency Threshold Estimation ---
