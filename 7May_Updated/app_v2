@@ -2,21 +2,22 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import os, re
+import os, joblib
 import plotly.express as px
 import plotly.graph_objects as go
 import matplotlib.pyplot as plt
 from arch import arch_model
 from scipy.stats import genpareto, kurtosis, skew
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolute_percentage_error
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.linear_model import LinearRegression, Ridge
-from sklearn.neighbors import KNeighborsRegressor
+from sklearn.linear_model import LinearRegression
 from sklearn.svm import SVR
 from keras.models import Sequential
 from keras.layers import LSTM, Dropout, Dense
+from keras.callbacks import EarlyStopping
+from keras.models import load_model
 from prophet import Prophet
 from statsmodels.tsa.stattools import adfuller
 import statsmodels.api as sm
@@ -36,7 +37,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Cache FX Data
+# --- FX Data Loader ---
 @st.cache_data
 def load_fx_data():
     df = pd.read_csv("reuters_fx_data.csv")
@@ -47,7 +48,83 @@ def load_fx_data():
     df["RealizedVol"] = df["OHLCVolatility"] / np.sqrt(252)
     return df.dropna()
 
+# --- Sequence Creator for ML Models ---
+def create_sequences(data, window):
+    X, y = [], []
+    for i in range(len(data) - window):
+        X.append(data[i:i+window])
+        y.append(data[i+window])
+    return np.array(X), np.array(y)
+
+# --- Model Loader ---
+def load_models(currency_name, path="models"):
+    try:
+        rf = joblib.load(f"{path}/rf_{currency_name}.pkl")
+        svr = joblib.load(f"{path}/svr_{currency_name}.pkl")
+        lr = joblib.load(f"{path}/lr_{currency_name}.pkl")
+        
+        # Load LSTM model with compile=False to avoid 'mse' resolution issue
+        lstm = load_model(f"{path}/lstm_{currency_name}.h5", compile=False)
+        
+        scaler = joblib.load(f"{path}/scaler_{currency_name}.pkl")
+        return {"Random Forest": rf, "SVR": svr, "Linear Regression": lr, "LSTM": lstm}, scaler
+    except Exception as e:
+        st.warning(f"Model loading failed for {currency_name}: {e}")
+        return None, None
+# --- Model Training and Saving ---
+def train_and_save_models(currency_name, df, save_path="models", window=30):
+    os.makedirs(save_path, exist_ok=True)
+    df_currency = df[df["Currency"] == currency_name][["Date", "Close"]].dropna().copy()
+    df_currency["Date"] = pd.to_datetime(df_currency["Date"])
+    df_currency.set_index("Date", inplace=True)
+
+    scaler = MinMaxScaler()
+    scaled_data = scaler.fit_transform(df_currency)
+
+    X, y = create_sequences(scaled_data, window)
+    X_rf = X.reshape(X.shape[0], -1)
+    X_lstm = X.reshape(X.shape[0], X.shape[1], 1)
+    y = y.ravel()
+
+    rf_params = {"n_estimators": [50, 100], "max_depth": [5, 10, None]}
+    rf = GridSearchCV(RandomForestRegressor(random_state=42), rf_params, cv=TimeSeriesSplit(n_splits=3))
+    rf.fit(X_rf, y)
+    joblib.dump(rf.best_estimator_, f"{save_path}/rf_{currency_name}.pkl")
+
+    svr_params = {"C": [1, 10], "gamma": ["scale", "auto"], "epsilon": [0.01, 0.1]}
+    svr = GridSearchCV(SVR(), svr_params, cv=TimeSeriesSplit(n_splits=3))
+    svr.fit(X_rf, y)
+    joblib.dump(svr.best_estimator_, f"{save_path}/svr_{currency_name}.pkl")
+
+    lr = LinearRegression()
+    lr.fit(X_rf, y)
+    joblib.dump(lr, f"{save_path}/lr_{currency_name}.pkl")
+
+    lstm = Sequential()
+    lstm.add(LSTM(64, input_shape=(X_lstm.shape[1], X_lstm.shape[2])))
+    lstm.add(Dropout(0.2))
+    lstm.add(Dense(1))
+    lstm.compile(loss='mse', optimizer='adam')
+
+    early_stop = EarlyStopping(monitor='loss', patience=3, restore_best_weights=True)
+    lstm.fit(X_lstm, y, epochs=20, batch_size=16, verbose=0, callbacks=[early_stop])
+    lstm.save(f"{save_path}/lstm_{currency_name}.h5")
+
+    joblib.dump(scaler, f"{save_path}/scaler_{currency_name}.pkl")
+    return True
+
+# --- FX Dataset ---
 df = load_fx_data()
+
+# --- Streamlit Sidebar / Trigger ---
+st.sidebar.header("Train FX Forecasting Models")
+currency = st.sidebar.selectbox("Select Currency", df["Currency"].unique().tolist())
+if st.sidebar.button("Train & Save Models"):
+    with st.spinner(f"Training models for {currency}..."):
+        success = train_and_save_models(currency, df)
+    if success:
+        st.sidebar.success(f"Models for {currency} saved to /models/")
+
 
 # Assign manual volatility group
 def assign_manual_group(vol):
@@ -255,6 +332,7 @@ with tab2:
 
 
 # --- Tab 3: Forecast with Dynamic Test Period ---
+# --- Tab 3: Forecast with Dynamic Test Period ---
 with tab3:
     st.header("Live FX Forecasting (Flexible Test Period)")
 
@@ -272,13 +350,14 @@ with tab3:
         test_df = df_ccy[df_ccy.index >= test_start]
 
         if train_df.empty or test_df.empty:
-            st.error("Not enough data for selected test period. Please adjust the test days slider.")
+            st.error("Not enough data for selected test period.")
         else:
             scaler = MinMaxScaler()
             scaled_all = scaler.fit_transform(df_ccy)
             scaled_train = scaler.transform(train_df)
             scaled_test = scaler.transform(test_df)
 
+            WINDOW = 30
             def create_sequences(data, window):
                 X, y = [], []
                 for i in range(len(data) - window):
@@ -286,19 +365,16 @@ with tab3:
                     y.append(data[i+window])
                 return np.array(X), np.array(y)
 
-            WINDOW = 30
             X_train, y_train = create_sequences(scaled_train, WINDOW)
-            X_train_rf = X_train.reshape(X_train.shape[0], -1)
-            X_train_lstm = X_train.reshape(X_train.shape[0], X_train.shape[1], 1)
-
             X_rf_test = []
             for i in range(len(test_df)):
                 X_rf_test.append(scaled_all[-(len(test_df) + WINDOW - i):-len(test_df) + i])
             X_rf_test = np.array(X_rf_test).reshape(len(X_rf_test), -1)
+            X_train_rf = X_train.reshape(X_train.shape[0], -1)
+            X_train_lstm = X_train.reshape(X_train.shape[0], X_train.shape[1], 1)
             X_lstm_test = np.array([x.reshape(WINDOW, 1) for x in X_rf_test])
 
             model_outputs_train, model_outputs_test = {}, {}
-
             rf = RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42)
             rf.fit(X_train_rf, y_train.ravel())
             model_outputs_train["Random Forest"] = rf.predict(X_train_rf)
@@ -346,19 +422,30 @@ with tab3:
 
             best_model = min(metrics, key=lambda x: x["Test MAPE"])
             model_name = best_model["Model"]
-            preds_inv = scaler.inverse_transform(
-                model_outputs_test[model_name].reshape(-1, 1)
-            ).flatten()
-            mape_pct = best_model["Test MAPE"] / 100
+            best_mape = best_model["Test MAPE"]
 
+            # --- LOG BEST MAPE ---
+            log_entry = pd.DataFrame([{
+                "RunDate": pd.Timestamp.today(),
+                "Currency": selected_currency,
+                "Model": model_name,
+                "MAPE": best_mape
+            }])
+            if os.path.exists("model_feedback_log.csv"):
+                existing = pd.read_csv("model_feedback_log.csv")
+                full_log = pd.concat([existing, log_entry], ignore_index=True)
+            else:
+                full_log = log_entry
+            full_log.to_csv("model_feedback_log.csv", index=False)
+
+            preds_inv = scaler.inverse_transform(model_outputs_test[model_name].reshape(-1, 1)).flatten()
+            mape_pct = best_mape / 100
             upper_bound = preds_inv * (1 + mape_pct)
             lower_bound = preds_inv * (1 - mape_pct)
-
             flag_mask = (y_true_test > upper_bound) | (y_true_test < lower_bound)
 
             fig.add_trace(go.Scatter(x=test_df.index, y=upper_bound, name="Dynamic Upper", line=dict(dash="dot", color="green")))
             fig.add_trace(go.Scatter(x=test_df.index, y=lower_bound, name="Dynamic Lower", line=dict(dash="dot", color="green")))
-
             fig.add_trace(go.Scatter(
                 x=test_df.index[flag_mask],
                 y=y_true_test[flag_mask],
@@ -375,11 +462,10 @@ with tab3:
             st.plotly_chart(fig, use_container_width=True)
 
 
-
 with tab4:
     st.header("Final Thresholds & Forecast Accuracy")
 
-    df_summary["FinalThreshold"] = df_summary[[ 
+    df_summary["FinalThreshold"] = df_summary[[
         "ManualThreshold", "95th_Pct", "GARCH_Forecast", "EVT_Threshold"
     ]].max(axis=1)
 
@@ -407,24 +493,20 @@ with tab4:
     - **Manual Group (based on OHLC)**: `{row['ManualGroup']}`
     - **Manual Threshold**: `{round(row['ManualThreshold'], 4)}`
     - **Final Dynamic Threshold** (Max of Models): `{round(row['FinalThreshold'], 4)}`
-    - **Best Model MAPE**: `{round(row['Best_MAPE'], 2)}%`
-    """)
+    - **Best Model MAPE**: `{round(row['Best_MAPE'], 2)}%`""" if pd.notnull(row['Best_MAPE']) else "Best Model MAPE: Not Available")
 
-    # --- Bar Plot: Thresholds & Best MAPE ---
     fig = go.Figure()
     fig.add_trace(go.Bar(name="Manual", x=[selected_currency], y=[row["ManualThreshold"]]))
     fig.add_trace(go.Bar(name="Final Dynamic", x=[selected_currency], y=[row["FinalThreshold"]]))
-    fig.add_trace(go.Bar(name="Best Model MAPE", x=[selected_currency], y=[row["Best_MAPE"] / 100]))
+    if pd.notnull(row["Best_MAPE"]):
+        fig.add_trace(go.Bar(name="Best Model MAPE", x=[selected_currency], y=[row["Best_MAPE"] / 100]))
     fig.update_layout(title="Threshold Comparison", barmode="group")
     st.plotly_chart(fig, use_container_width=True)
 
-    # --- Volatility Trend with Thresholds & MAPE Band ---
     st.subheader("Historical Volatility Trend & Breach Flags")
-    trend_df = df[df["Currency"] == selected_currency].copy()
-    trend_df = trend_df.sort_values("Date")
+    trend_df = df[df["Currency"] == selected_currency].copy().sort_values("Date")
     y_actual = trend_df["Volatility"].values
     dates = trend_df["Date"]
-
     best_mape = row["Best_MAPE"] or 0
     mape_pct = best_mape / 100
 
@@ -438,8 +520,6 @@ with tab4:
     fig_vol.add_trace(go.Scatter(x=dates, y=lower_band, name="Dynamic Lower", line=dict(dash="dot", color="green")))
     fig_vol.add_hline(y=row["ManualThreshold"], line_color="red", line_dash="dot", annotation_text="Manual")
     fig_vol.add_hline(y=row["FinalThreshold"], line_color="orange", line_dash="dash", annotation_text="Final Dynamic")
-
-    # Deviation flags
     fig_vol.add_trace(go.Scatter(
         x=dates[flag_mask],
         y=y_actual[flag_mask],
@@ -447,13 +527,13 @@ with tab4:
         name="Flagged Deviations",
         marker=dict(color="red", size=8, symbol="x")
     ))
-
     fig_vol.update_layout(
         title=f"{selected_currency}: Volatility with Manual, Dynamic Thresholds & Flags",
         xaxis_title="Date",
         yaxis_title="Annualized Volatility"
     )
     st.plotly_chart(fig_vol, use_container_width=True)
+
 
 
 # --- Tab 5: Cross-Currency Threshold Estimation ---
