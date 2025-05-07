@@ -1,0 +1,12 @@
+def seasonal_decomposition_plot(df, currency):
+    sub_df = df[df["Currency"] == currency][["Date", "Close"]].dropna()
+    series = sub_df.set_index("Date")["Close"].resample("W").mean().ffill()
+
+    if len(series) < 104:
+        st.warning(f"Not enough data to perform seasonal decomposition (needs ≥ 104 weekly observations, found {len(series)}).")
+        return
+
+    result = sm.tsa.seasonal_decompose(series, model='multiplicative')
+    fig = result.plot()
+    plt.suptitle(f"{currency} Seasonal Decomposition (Weekly Aggregated)")
+    st.pyplot(fig)
