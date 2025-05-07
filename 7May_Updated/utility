@@ -1,0 +1,69 @@
+# --- New Utility Functions for Stationarity, Prophet Forecasting, Decomposition ---
+
+from statsmodels.tsa.stattools import adfuller
+from prophet import Prophet
+
+# Stationarity Check (ADF Test)
+def adf_stationarity_test(series):
+    result = adfuller(series.dropna())
+    return {
+        "ADF Statistic": result[0],
+        "p-value": result[1],
+        "IsStationary": result[1] < 0.05
+    }
+
+# Convert to stationary using log-differencing if needed
+def make_stationary(series):
+    result = adf_stationarity_test(series)
+    if not result["IsStationary"]:
+        return np.log(series).diff().dropna(), True
+    return series, False
+
+# Prophet Forecast (Univariate)
+def prophet_univariate_forecast(df, currency, plot=True):
+    sub_df = df[df["Currency"] == currency][["Date", "Close"]].dropna()
+    sub_df = sub_df.rename(columns={"Date": "ds", "Close": "y"})
+
+    model = Prophet(seasonality_mode="multiplicative", daily_seasonality=True)
+    model.fit(sub_df)
+
+    future = model.make_future_dataframe(periods=15)
+    forecast = model.predict(future)
+
+    if plot:
+        fig = model.plot(forecast)
+        plt.title(f"{currency} Prophet Forecast (Univariate)")
+        st.pyplot(fig)
+
+    return forecast
+
+# Prophet Forecast (Multivariate)
+def prophet_multivariate_forecast(df, currency, plot=True):
+    sub_df = df[df["Currency"] == currency][["Date", "high", "low", "Close"]].dropna()
+    sub_df = sub_df.rename(columns={"Date": "ds", "Close": "y", "high": "add1", "low": "add2"})
+
+    model = Prophet(seasonality_mode="multiplicative", daily_seasonality=True)
+    model.add_regressor("add1")
+    model.add_regressor("add2")
+    model.fit(sub_df)
+
+    future = sub_df.drop(columns=["y"])
+    forecast = model.predict(future)
+
+    if plot:
+        fig = model.plot(forecast)
+        plt.title(f"{currency} Prophet Forecast (Multivariate)")
+        st.pyplot(fig)
+
+    return forecast
+
+# Seasonal Decomposition (Trend, Seasonality, Residual)
+import statsmodels.api as sm
+def seasonal_decomposition_plot(df, currency):
+    sub_df = df[df["Currency"] == currency][["Date", "Close"]].dropna()
+    series = sub_df.set_index("Date")["Close"].resample("W").mean().ffill()
+
+    result = sm.tsa.seasonal_decompose(series, model='multiplicative')
+    fig = result.plot()
+    plt.suptitle(f"{currency} Seasonal Decomposition (Weekly Aggregated)")
+    st.pyplot(fig)
