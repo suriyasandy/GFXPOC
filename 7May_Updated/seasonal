@@ -1,0 +1,15 @@
+def seasonal_decomposition_plot(df, currency, freq="W"):
+    sub_df = df[df["Currency"] == currency][["Date", "Close"]].dropna()
+    series = sub_df.set_index("Date")["Close"].resample(freq).mean().ffill()
+
+    # Determine required minimum data length
+    min_required = 104 if freq == "W" else 730 if freq == "D" else 24  # Weekly, Daily, Monthly
+    if len(series) < min_required:
+        st.warning(f"Not enough data for decomposition at '{freq}' frequency. Required ≥ {min_required}, found {len(series)}.")
+        return
+
+    result = sm.tsa.seasonal_decompose(series, model='multiplicative')
+    fig = result.plot()
+    freq_label = {"W": "Weekly", "D": "Daily", "M": "Monthly"}[freq]
+    plt.suptitle(f"{currency} Seasonal Decomposition ({freq_label} Aggregated)")
+    st.pyplot(fig)
