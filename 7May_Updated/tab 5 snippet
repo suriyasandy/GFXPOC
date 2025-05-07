@@ -1,0 +1,3 @@
+    st.subheader("Seasonal Decomposition (Select Resample Frequency)")
+    freq = st.radio("Resample Frequency", options=["W", "M", "D"], format_func=lambda x: {"W": "Weekly", "M": "Monthly", "D": "Daily"}[x])
+    seasonal_decomposition_plot(df, selected_currency_tab5, freq=freq)
