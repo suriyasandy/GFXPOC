@@ -10,7 +10,7 @@ from arch import arch_model
 from scipy.stats import genpareto, kurtosis, skew
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
-from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error,root_mean_squared_error
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error,root_mean_squared_error,mean_squared_error
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.svm import SVR
@@ -34,7 +34,7 @@ EVT_TAIL_PCT = 0.995
 
 # Page config
 st.set_page_config(page_title="FX Volatility App", layout="wide")
-
+ROLL_WINDOW = st.sidebar.slider("Rolling Window (Days)", 20, 120, 60,step=10)
 # Background CSS
 st.markdown("""
 <style>
@@ -44,12 +44,12 @@ st.markdown("""
 
 # --- FX Data Loader ---
 @st.cache_data
-def load_fx_data():
+def load_fx_data(roll_window):
     df = pd.read_csv("reuters_fx_data.csv")
     df["Date"] = pd.to_datetime(df["Date"])
     df.sort_values(["Currency", "Date"], inplace=True)
     df["LogReturn"] = df.groupby("Currency")["Close"].transform(lambda x: np.log(x).diff())
-    df["Volatility"] = df.groupby("Currency")["LogReturn"].transform(lambda x: x.rolling(ROLL_WINDOW).std()) * ANNUALIZE
+    df["Volatility"] = df.groupby("Currency")["LogReturn"].transform(lambda x: x.rolling(roll_window).std()) * ANNUALIZE
     df["RealizedVol"] = df["OHLCVolatility"] / np.sqrt(252)
     return df.dropna()
 
@@ -65,6 +65,7 @@ def create_sequences(data, window):
         y.append(data[i+window])
     return np.array(X), np.array(y)
 
+
 # --- Model Loader ---
 def load_models(currency_name, path="models"):
     try:
@@ -79,116 +80,67 @@ def load_models(currency_name, path="models"):
         return None, None
 
 # --- Model Training and Saving ---
-def log_model_performance(currency, model_name, y_true, y_pred, log_file="model_feedback_log.csv"):
-    metrics = {
-        "Currency": currency,
-        "Model": model_name,
-        "MAE": mean_absolute_error(y_true, y_pred),
-        "RMSE": root_mean_squared_error(y_true, y_pred),
-        "MAPE": mean_absolute_percentage_error(y_true, y_pred),
-        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
-    log_entry = pd.DataFrame([metrics])
-    if os.path.exists(log_file):
-        existing = pd.read_csv(log_file)
-        updated = pd.concat([existing, log_entry], ignore_index=True)
-    else:
-        updated = log_entry
-    updated.to_csv(log_file, index=False)
-
-def train_and_save_models(currency_name, df, save_path="models", window=30):
+def train_and_save_models(currency_name, df, save_path="models", window=ROLL_WINDOW):
     os.makedirs(save_path, exist_ok=True)
     df_currency = df[df["Currency"] == currency_name][["Date", "Close"]].dropna().copy()
     df_currency["Date"] = pd.to_datetime(df_currency["Date"])
     df_currency.set_index("Date", inplace=True)
 
-    # Normalize data
     scaler = MinMaxScaler()
     scaled_data = scaler.fit_transform(df_currency)
 
-    # Create sequences
     X, y = create_sequences(scaled_data, window)
     X_rf = X.reshape(X.shape[0], -1)
     X_lstm = X.reshape(X.shape[0], X.shape[1], 1)
     y = y.ravel()
 
-    # Train/Test split
-    train_size = int(len(X_rf) * 0.8)
-    X_train_rf, X_test_rf = X_rf[:train_size], X_rf[train_size:]
-    y_train, y_test = y[:train_size], y[train_size:]
+    rf_params = {"n_estimators": [50, 100], "max_depth": [5, 10, None]}
+    rf = GridSearchCV(RandomForestRegressor(random_state=42), rf_params, cv=TimeSeriesSplit(n_splits=3))
+    rf.fit(X_rf, y)
+    joblib.dump(rf.best_estimator_, f"{save_path}/rf_{currency_name}.pkl")
 
-    # --- Random Forest ---
-    rf_params = {"n_estimators": [50, 100], "max_depth": [5, 10]}
-    rf_grid = GridSearchCV(RandomForestRegressor(random_state=42), rf_params, cv=3, n_jobs=-1)
-    rf_grid.fit(X_train_rf, y_train)
-    rf = rf_grid.best_estimator_
-    joblib.dump(rf, f"{save_path}/rf_{currency_name}.pkl")
-    rf_preds = rf.predict(X_test_rf)
-    log_model_performance(currency_name, "Random Forest", y_test, rf_preds)
+    svr_params = {"C": [1, 10], "gamma": ["scale", "auto"], "epsilon": [0.01, 0.1]}
+    svr = GridSearchCV(SVR(), svr_params, cv=TimeSeriesSplit(n_splits=3))
+    svr.fit(X_rf, y)
+    joblib.dump(svr.best_estimator_, f"{save_path}/svr_{currency_name}.pkl")
 
-    # --- SVR ---
-    svr_params = {"C": [1, 10], "epsilon": [0.01, 0.1]}
-    svr_grid = GridSearchCV(SVR(), svr_params, cv=3, n_jobs=-1)
-    svr_grid.fit(X_train_rf, y_train)
-    svr = svr_grid.best_estimator_
-    joblib.dump(svr, f"{save_path}/svr_{currency_name}.pkl")
-    svr_preds = svr.predict(X_test_rf)
-    log_model_performance(currency_name, "SVR", y_test, svr_preds)
-
-    # --- Linear Regression ---
     lr = LinearRegression()
-    lr.fit(X_train_rf, y_train)
+    lr.fit(X_rf, y)
     joblib.dump(lr, f"{save_path}/lr_{currency_name}.pkl")
-    lr_preds = lr.predict(X_test_rf)
-    log_model_performance(currency_name, "Linear Regression", y_test, lr_preds)
 
-    # --- LSTM ---
-    X_train_lstm = X_lstm[:train_size]
-    X_test_lstm = X_lstm[train_size:]
-    y_train_scaled = y_train  # already normalized
-    y_test_scaled = y_test
+    lstm = Sequential()
+    lstm.add(LSTM(64, input_shape=(X_lstm.shape[1], X_lstm.shape[2])))
+    lstm.add(Dropout(0.2))
+    lstm.add(Dense(1))
+    lstm.compile(loss='mse', optimizer='adam')
 
-    best_mae = np.inf
-    best_model = None
-    for units in [32, 64]:
-        for dropout in [0.1, 0.2]:
-            for batch_size in [8, 16]:
-                model = Sequential()
-                model.add(LSTM(units, input_shape=(X_train_lstm.shape[1], 1)))
-                model.add(Dropout(dropout))
-                model.add(Dense(1))
-                model.compile(loss='mse', optimizer='adam')
-                early_stop = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+    early_stop = EarlyStopping(monitor='loss', patience=3, restore_best_weights=True)
+    lstm.fit(X_lstm, y, epochs=20, batch_size=16, verbose=0, callbacks=[early_stop])
+    lstm.save(f"{save_path}/lstm_{currency_name}.h5")
 
-                model.fit(X_train_lstm, y_train_scaled, epochs=30, batch_size=batch_size,
-                          validation_split=0.2, verbose=0, callbacks=[early_stop])
-                
-                preds = model.predict(X_test_lstm).ravel()
-                mae = mean_absolute_error(y_test_scaled, preds)
-
-                if mae < best_mae:
-                    best_mae = mae
-                    best_model = model
-                    best_preds = preds
-
-    best_model.save(f"{save_path}/lstm_{currency_name}.h5")
     joblib.dump(scaler, f"{save_path}/scaler_{currency_name}.pkl")
-    log_model_performance(currency_name, "LSTM", y_test_scaled, best_preds)
-
     return True
 
-# --- FX Dataset ---
-df = load_fx_data()
 
-from datetime import datetime
+# --- FX Dataset ---
+df = load_fx_data(ROLL_WINDOW)
+
 
 # Sidebar: Controls
-st.sidebar.header(" Train FX Forecasting Models")
+# Sidebar: Controls
+st.sidebar.header("⚙️ Train FX Forecasting Models")
+
+# Currency selection
 currency_option = st.sidebar.selectbox("Select Currency", df["Currency"].unique())
+
+# Model path input
 model_dir = st.sidebar.text_input("Model Save Path", value="models")
+
+# Force retrain checkbox
 force_retrain = st.sidebar.checkbox("Force Retrain Models", value=False)
 
-if st.sidebar.button(" Train & Save Models"):
+# Model training trigger
+if st.sidebar.button("Train & Save Models"):
     model_path_check = all([
         os.path.exists(f"{model_dir}/rf_{currency_option}.pkl"),
         os.path.exists(f"{model_dir}/svr_{currency_option}.pkl"),
@@ -197,17 +149,18 @@ if st.sidebar.button(" Train & Save Models"):
     ])
     if not model_path_check or force_retrain:
         with st.spinner(f"Training models for {currency_option}..."):
-            success = train_and_save_models(currency_option, df, save_path=model_dir)
+            success = train_and_save_models(currency_option, df, save_path=model_dir, window=ROLL_WINDOW)
         if success:
-            st.sidebar.success(f" Models for {currency_option} saved to `{model_dir}`")
+            st.sidebar.success(f" Models for `{currency_option}` saved to `{model_dir}`")
             st.rerun()
     else:
         st.sidebar.info(" Models already exist. Use 'Force Retrain' to overwrite.")
 
+
 # View log comparison
 if st.sidebar.button(" View Model Feedback Log"):
     try:
-        log_df = pd.read_csv("model_feedback_log.csv")
+        log_df = pd.read_csv("logs/model_feedback_log.csv")
         st.sidebar.dataframe(log_df[log_df["Currency"] == currency_option])
     except Exception as e:
         st.sidebar.error("No log found yet.")
@@ -228,11 +181,12 @@ def assign_manual_group(vol):
 
 
 @st.cache_data
-def compute_thresholds_per_currency(df):
+def compute_thresholds_per_currency(df,roll_window):
     summary = []
     for ccy, group in df.groupby("Currency"):
+        log_ret = group["LogReturn"].dropna()
         # Volatility for dynamic models (unchanged)
-        vol_series = group["Volatility"].dropna()
+        vol_series = group["LogReturn"].rolling(roll_window).std() * ANNUALIZE
         avg_vol = vol_series.mean()
 
         # Manual group uses realized OHLC volatility
@@ -262,6 +216,13 @@ def compute_thresholds_per_currency(df):
         except:
             evt_threshold = np.nan
 
+        # GARCH forecast should use raw log returns
+        try:
+            am = arch_model(log_ret, vol='GARCH', p=1, q=1)
+            res = am.fit(disp="off")
+            forecast = res.forecast(horizon=1).variance.values[-1][0] ** 0.5
+        except:
+            forecast = np.nan
         summary.append({
             "Currency": ccy,
             "AvgVol": avg_vol,
@@ -274,7 +235,9 @@ def compute_thresholds_per_currency(df):
         })
     return pd.DataFrame(summary)
 
-df_summary = compute_thresholds_per_currency(df)
+
+
+df_summary = compute_thresholds_per_currency(df,ROLL_WINDOW)
 
 
 # Tab layout
@@ -304,6 +267,19 @@ with tab1:
     - Adapted from statistical/ML models using rolling vol.
     - Explainable and validated per currency.
     - Improve alert accuracy and stakeholder trust.
+                
+    ###  What is the Rolling Window?
+
+    A rolling window defines how many past days are used to compute volatility:
+    - Smaller windows (e.g., 30 days) → More responsive but noisier thresholds
+    - Larger windows (e.g., 90+ days) → Smoother trends but slower to detect shocks
+
+    You can choose this window in the sidebar.  
+    All dynamic models (GARCH, EVT, synthetic volatility, and forecasts) will use this setting for consistency.
+
+    ### Why are dynamic volatilities often higher than manual ones?**  
+    - Manual thresholds rely on smoothed OHLC-based realized volatility, 
+    - While dynamic thresholds use log-return-based volatility — which captures sudden spikes and real-time market stress more effectively.
 
     Use the tabs to explore per-currency insights.
     """)
@@ -322,12 +298,67 @@ with tab2:
     selected_currency = st.selectbox("Select Currency", df["Currency"].unique(),index=None, key="tab1_currency")
     if selected_currency:
         df_currency = df[df["Currency"] == selected_currency].copy().sort_values("Date")
+        df_summary_sel = df_summary[df_summary["Currency"] == selected_currency]
+        st.dataframe(df_summary_sel[[ "Currency", "AvgVol", "AvgRealizedVol",
+                                "ManualGroup", "ManualThreshold", 
+                                "GARCH_Forecast", "95th_Pct", "EVT_Threshold"]],
+                    use_container_width=True)
+        series = df[df["Currency"] == selected_currency].copy().sort_values("Date")
+        series["LogReturn"] = np.log(series["Close"]).diff()
 
-        st.subheader(f" {selected_currency} Close Price Trend")
-        fig = px.line(df_currency, x="Date", y="Close")
+        tr1 = series["High"] - series["Low"]
+        tr2 = (series["High"] - series["Close"].shift()).abs()
+        tr3 = (series["Low"] - series["Close"].shift()).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        series["ATR"] = tr.rolling(window=14).mean()
+        series["ATR_Threshold"] = series["ATR"] * 1.5
+        series["DonchianUpper"] = series["High"].rolling(20).max()
+        series["DonchianLower"] = series["Low"].rolling(20).min()
+        hl2 = (series["High"] + series["Low"]) / 2
+        series["SuperTrend"] = np.where(series["Close"] > hl2 - (2 * series["ATR"]),
+                                        hl2 - (2 * series["ATR"]), hl2 + (2 * series["ATR"]))
+        # --- (A) Volatility Threshold Comparison ---
+        fig = px.line(series, x="Date", y="OHLCVolatility", title=f"{selected_currency}: Volatility vs Thresholds")
+        for label in ["ManualThreshold", "GARCH_Forecast", "95th_Pct", "EVT_Threshold"]:
+            val = df_summary[df_summary["Currency"] == selected_currency][label].values[0]
+            if pd.notnull(val):
+                fig.add_hline(y=val, line_dash="dot", annotation_text=label)
         st.plotly_chart(fig, use_container_width=True)
 
-        with st.expander("🔍 Explore KDE, Boxplot, and Seasonality"):
+        # --- (B) Technical Indicator Plot ---
+        with st.expander("📊 View Technical Indicators on Price"):
+            fig2 = go.Figure()
+            fig2.add_trace(go.Scatter(x=series["Date"], y=series["Close"], name="Close Price"))
+            fig2.add_trace(go.Scatter(x=series["Date"], y=series["SuperTrend"], name="SuperTrend", line=dict(dash="dot")))
+            fig2.add_trace(go.Scatter(x=series["Date"], y=series["DonchianUpper"], name="Donchian Upper", line=dict(dash="dot")))
+            fig2.add_trace(go.Scatter(x=series["Date"], y=series["ATR_Threshold"], name="ATR Threshold", line=dict(dash="dot")))
+
+            fig2.update_layout(title=f"{selected_currency}: Price vs Technical Indicators", xaxis_title="Date", yaxis_title="Price")
+            st.plotly_chart(fig2, use_container_width=True)
+
+            st.dataframe(series[["Date", "Close", "ATR_Threshold", "DonchianUpper", "SuperTrend"]].tail(30), use_container_width=True)
+
+        st.markdown("""
+        ###  Understanding the Threshold Models
+
+        Each dynamic threshold serves a distinct purpose. Here's how to interpret them:
+
+        | Threshold Type       | What it Measures                                | Typical Level | Purpose                      |
+        |----------------------|--------------------------------------------------|---------------|-------------------------------|
+        | **GARCH Forecast**   | Expected near-term volatility (next 1 day)       | 🟡 Lower       | Stable market forecasting     |
+        | **95th Percentile**  | Top 5% of historical rolling volatilities        | 🟠 High        | Detect sharp volatility moves |
+        | **EVT Threshold**    | Statistically rare tail events                   | 🔴 Very High   | Capture extreme regime shifts |
+        | **Manual Threshold** | Fixed, rule-based band from OHLC behavior        | ⚪️ Static      | Operational baseline           |
+
+        > GARCH is best for short-term expectations,  
+        > while Percentile and EVT thresholds act as **market stress detectors**.
+
+        By combining all three, we can **confidently flag real risk** without triggering false alerts.
+        """)
+        with st.expander("Explore Close Pricce, KDE, Boxplot, and Seasonality"):
+            st.subheader(f" {selected_currency} Close Price Trend")
+            fig = px.line(df_currency, x="Date", y="Close")
+            st.plotly_chart(fig, use_container_width=True)            
             fig_kde = px.histogram(df_currency, x='Close', histnorm='probability density')
             st.plotly_chart(fig_kde, use_container_width=True)
 
@@ -345,286 +376,288 @@ with tab2:
                 st.plotly_chart(fig_decomp, use_container_width=True)
             except Exception as e:
                 st.warning(f"Decomposition error: {e}")
-    st.dataframe(df_summary[[ "Currency", "AvgVol", "AvgRealizedVol",
-                              "ManualGroup", "ManualThreshold", 
-                              "GARCH_Forecast", "95th_Pct", "EVT_Threshold"]],
-                 use_container_width=True)
-
-    sel = st.selectbox("Select Currency", df_summary["Currency"], key="tab2_currency")
-    series = df[df["Currency"] == sel].copy().sort_values("Date")
-    series["LogReturn"] = np.log(series["Close"]).diff()
-
-    tr1 = series["High"] - series["Low"]
-    tr2 = (series["High"] - series["Close"].shift()).abs()
-    tr3 = (series["Low"] - series["Close"].shift()).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    series["ATR"] = tr.rolling(window=14).mean()
-    series["ATR_Threshold"] = series["ATR"] * 1.5
-    series["DonchianUpper"] = series["High"].rolling(20).max()
-    series["DonchianLower"] = series["Low"].rolling(20).min()
-    hl2 = (series["High"] + series["Low"]) / 2
-    series["SuperTrend"] = np.where(series["Close"] > hl2 - (2 * series["ATR"]),
-                                    hl2 - (2 * series["ATR"]), hl2 + (2 * series["ATR"]))
-
-    fig = px.line(series, x="Date", y="OHLCVolatility", title=f"{sel}: Volatility vs All Thresholds")
-
-    for label in ["ManualThreshold", "GARCH_Forecast", "95th_Pct", "EVT_Threshold"]:
-        val = df_summary[df_summary["Currency"] == sel][label].values[0]
-        if pd.notnull(val):
-            fig.add_hline(y=val, line_dash="dot", annotation_text=label)
-
-    fig.add_trace(go.Scatter(x=series["Date"], y=series["ATR_Threshold"], name="ATR Threshold", line=dict(dash="dot")))
-    fig.add_trace(go.Scatter(x=series["Date"], y=series["DonchianUpper"], name="Donchian Upper", line=dict(dash="dot")))
-    fig.add_trace(go.Scatter(x=series["Date"], y=series["SuperTrend"], name="SuperTrend", line=dict(dash="dot")))
-
-    st.plotly_chart(fig, use_container_width=True)
-
-    with st.expander(" Last 30-Day Threshold Snapshot"):
-        st.dataframe(series[[ "Date", "OHLCVolatility", "ATR_Threshold",
-                              "DonchianUpper", "SuperTrend" ]].tail(30), use_container_width=True)
+        with st.expander(" Last 30-Day Threshold Snapshot"):
+            st.dataframe(series[[ "Date", "OHLCVolatility", "ATR_Threshold",
+                                "DonchianUpper", "SuperTrend" ]].tail(30), use_container_width=True)
+# --- Tab 3: Forecast with Dynamic Test Period ---
 with tab3:
-    st.header(" ML-Based FX Forecasting (Train/Test + Tuning + Explainability)")
+    st.header("Live FX Forecasting (Flexible Test Period)")
 
-    st.markdown("""
-    This tab uses saved models (if available) or retrains on-the-fly if missing.  
-    It compares:
-    - Random Forest, SVR, Linear Regression, LSTM, XGBoost
-    - LSTM shows confidence bands
-    - SHAP explains RF predictions
-    """)
+    selected_currency = st.selectbox("Select Currency", df["Currency"].unique(),index=None, key="fx_forecast_currency")
+    test_days = st.slider("Select Test Period (days before latest date)", min_value=30, max_value=90, step=30, value=60)
 
-    selected_currency = st.selectbox("Select Currency for Forecasting", df["Currency"].unique(),index=None, key="tab3_cur")
-    forecast_horizon = st.slider("Forecast Horizon (Days)", 5, 60, 20)
     if selected_currency:
-        df_cur = df[df["Currency"] == selected_currency][["Date", "Close"]].copy()
-        df_cur["Date"] = pd.to_datetime(df_cur["Date"])
-        df_cur.set_index("Date", inplace=True)
+        df_ccy = df[df["Currency"] == selected_currency][["Date", "Close"]].dropna().copy()
+        df_ccy["Date"] = pd.to_datetime(df_ccy["Date"])
+        df_ccy.set_index("Date", inplace=True)
 
-        # Create lag features
-        for i in range(1, 8):
-            df_cur[f"lag_{i}"] = df_cur["Close"].shift(i)
-        df_cur.dropna(inplace=True)
+        latest_date = df_ccy.index.max()
+        test_start = latest_date - pd.Timedelta(days=test_days)
+        train_df = df_ccy[df_ccy.index < test_start]
+        test_df = df_ccy[df_ccy.index >= test_start]
 
-        X = df_cur.drop(columns="Close")
-        y = df_cur["Close"]
-        X_train, X_test = X.iloc[:-forecast_horizon], X.iloc[-forecast_horizon:]
-        y_train, y_test = y.iloc[:-forecast_horizon], y.iloc[-forecast_horizon:]
-
-        # Scale
-        scaler = MinMaxScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_test_scaled = scaler.transform(X_test)
-
-        # Load saved models
-        model_dict, saved_scaler = load_models(selected_currency)
-        use_saved = model_dict is not None
-
-        if use_saved:
-            st.success(" Loaded saved models for forecasting.")
-
-            rf_preds = model_dict["Random Forest"].predict(X_test_scaled)
-            svr_preds = model_dict["SVR"].predict(X_test_scaled)
-            lr_preds = model_dict["Linear Regression"].predict(X_test_scaled)
-
-            # LSTM reshape
-            X_test_lstm = X_test_scaled.reshape((X_test_scaled.shape[0], X_test_scaled.shape[1], 1))
-            lstm = model_dict["LSTM"]
-            lstm_preds_scaled = lstm.predict(X_test_lstm).ravel()
-            lstm_preds = saved_scaler.inverse_transform(lstm_preds_scaled.reshape(-1, 1)).ravel()
-
+        if train_df.empty or test_df.empty:
+            st.error("Not enough data for selected test period.")
         else:
-            st.warning(" Saved models not found. Retraining from scratch...")
+            scaler = MinMaxScaler()
+            scaled_all = scaler.fit_transform(df_ccy)
+            scaled_train = scaler.transform(train_df)
+            scaled_test = scaler.transform(test_df)
 
-            # --- Model 1: Random Forest ---
-            rf = RandomForestRegressor(n_estimators=100, max_depth=5, random_state=42)
-            rf.fit(X_train_scaled, y_train)
-            rf_preds = rf.predict(X_test_scaled)
+            def create_sequences(data, window):
+                X, y = [], []
+                for i in range(len(data) - window):
+                    X.append(data[i:i+window])
+                    y.append(data[i+window])
+                return np.array(X), np.array(y)
 
-            # --- Model 2: SVR ---
-            svr = SVR(C=10, epsilon=0.1)
-            svr.fit(X_train_scaled, y_train)
-            svr_preds = svr.predict(X_test_scaled)
+            WINDOW = 30
+            X_train, y_train = create_sequences(scaled_train, WINDOW)
+            X_rf_test = []
+            for i in range(len(test_df)):
+                X_rf_test.append(scaled_all[-(len(test_df) + WINDOW - i):-len(test_df) + i])
+            X_rf_test = np.array(X_rf_test).reshape(len(X_rf_test), -1)
+            X_train_rf = X_train.reshape(X_train.shape[0], -1)
+            X_train_lstm = X_train.reshape(X_train.shape[0], X_train.shape[1], 1)
+            X_lstm_test = np.array([x.reshape(WINDOW, 1) for x in X_rf_test])
 
-            # --- Model 3: Linear Regression ---
-            lr = LinearRegression()
-            lr.fit(X_train_scaled, y_train)
-            lr_preds = lr.predict(X_test_scaled)
-
-            # --- Model 4: LSTM ---
-            y_scaler = MinMaxScaler()
-            y_train_scaled = y_scaler.fit_transform(y_train.values.reshape(-1, 1)).ravel()
-            X_train_lstm = X_train_scaled.reshape((X_train_scaled.shape[0], X_train_scaled.shape[1], 1))
-            X_test_lstm = X_test_scaled.reshape((X_test_scaled.shape[0], X_test_scaled.shape[1], 1))
+            model_outputs_train, model_outputs_test = {}, {}
+            rf = RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42)
+            rf.fit(X_train_rf, y_train.ravel())
+            model_outputs_train["Random Forest"] = rf.predict(X_train_rf)
+            model_outputs_test["Random Forest"] = rf.predict(X_rf_test)
 
             lstm = Sequential()
-            lstm.add(LSTM(64, input_shape=(X_train_lstm.shape[1], 1)))
+            lstm.add(LSTM(64, input_shape=(WINDOW, 1)))
             lstm.add(Dropout(0.2))
             lstm.add(Dense(1))
-            lstm.compile(loss='mse', optimizer='adam')
-            early_stop = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
-            lstm.fit(X_train_lstm, y_train_scaled, epochs=25, batch_size=16, validation_split=0.2, verbose=0, callbacks=[early_stop])
+            lstm.compile(optimizer="adam", loss="mse")
+            lstm.fit(X_train_lstm, y_train, epochs=20, batch_size=16, verbose=0)
+            model_outputs_train["LSTM"] = lstm.predict(X_train_lstm).ravel()
+            model_outputs_test["LSTM"] = lstm.predict(X_lstm_test).ravel()
 
-            lstm_preds_scaled = lstm.predict(X_test_lstm).ravel()
-            lstm_preds = y_scaler.inverse_transform(lstm_preds_scaled.reshape(-1, 1)).ravel()
+            lr = LinearRegression()
+            lr.fit(X_train_rf, y_train)
+            model_outputs_train["Linear Regression"] = lr.predict(X_train_rf)
+            model_outputs_test["Linear Regression"] = lr.predict(X_rf_test)
 
-        # --- Model 5: XGBoost ---
-        xgb = XGBRegressor(n_estimators=100, max_depth=5, random_state=42, verbosity=0)
-        xgb.fit(X_train_scaled, y_train)
-        xgb_preds = xgb.predict(X_test_scaled)
+            y_true_train = scaler.inverse_transform(y_train.reshape(-1, 1)).flatten()
+            y_true_test = test_df["Close"].values
 
-        # --- Forecast Results ---
-        results = pd.DataFrame({
-            "Date": X_test.index,
-            "Actual": y_test.values,
-            "RandomForest": rf_preds,
-            "SVR": svr_preds,
-            "LinearRegression": lr_preds,
-            "XGBoost": xgb_preds,
-            "LSTM": lstm_preds
-        }).set_index("Date")
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=train_df.index[-len(y_true_train):], y=y_true_train, name="Actual (Train)", line=dict(color="white")))
+            fig.add_trace(go.Scatter(x=test_df.index, y=y_true_test, name="Actual (Test)", line=dict(color="white", dash="dot")))
 
-        # Confidence Interval for LSTM
-        lstm_std = np.std(y_train - lstm.predict(X_train_scaled.reshape(X_train_scaled.shape[0], -1, 1)).flatten())
-        results["LSTM_upper"] = results["LSTM"] + 1.96 * lstm_std
-        results["LSTM_lower"] = results["LSTM"] - 1.96 * lstm_std
+            metrics = []
+            for model, preds_train in model_outputs_train.items():
+                preds_train_inv = scaler.inverse_transform(preds_train.reshape(-1, 1)).flatten()
+                preds_test_inv = scaler.inverse_transform(model_outputs_test[model].reshape(-1, 1)).flatten()
 
-        # --- Plot ---
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=results.index, y=results["Actual"], name="Actual", line=dict(color="white")))
-        for col in ["RandomForest", "SVR", "LinearRegression", "XGBoost", "LSTM"]:
-            fig.add_trace(go.Scatter(x=results.index, y=results[col], name=col))
-        fig.add_trace(go.Scatter(
-            x=results.index.tolist() + results.index[::-1].tolist(),
-            y=results["LSTM_upper"].tolist() + results["LSTM_lower"][::-1].tolist(),
-            fill='toself', fillcolor='rgba(0,255,255,0.2)',
-            line=dict(color='rgba(255,255,255,0)'), name="LSTM CI", showlegend=False
-        ))
-        fig.update_layout(title=f"{selected_currency}: Model Forecasts vs Actual", xaxis_title="Date", yaxis_title="Close")
-        st.plotly_chart(fig, use_container_width=True)
+                fig.add_trace(go.Scatter(x=train_df.index[-len(y_true_train):], y=preds_train_inv, name=f"{model} (Train)", line=dict(dash="dash")))
+                fig.add_trace(go.Scatter(x=test_df.index, y=preds_test_inv, name=f"{model} (Test)", line=dict(dash="solid")))
 
-        # --- Metrics ---
-        st.subheader(" Forecast Accuracy Metrics")
-        def rmse(y_true, y_pred): return ((y_true - y_pred) ** 2).mean() ** 0.5
-        metrics = {
-            "Model": [],
-            "MAE": [],
-            "RMSE": [],
-            "MAPE": []
-        }
-        for name, pred in [("Random Forest", rf_preds), ("SVR", svr_preds), ("Linear Regression", lr_preds),
-                        ("XGBoost", xgb_preds), ("LSTM", lstm_preds)]:
-            metrics["Model"].append(name)
-            metrics["MAE"].append(mean_absolute_error(y_test, pred))
-            metrics["RMSE"].append(rmse(y_test, pred))
-            metrics["MAPE"].append(mean_absolute_percentage_error(y_test, pred))
-        st.dataframe(pd.DataFrame(metrics).round(4), use_container_width=True)
+                metrics.append({
+                    "Model": model,
+                    "Train MAPE": mean_absolute_percentage_error(y_true_train, preds_train_inv) * 100,
+                    "Test MAPE": mean_absolute_percentage_error(y_true_test, preds_test_inv) * 100,
+                    "Train RMSE": np.sqrt(mean_squared_error(y_true_train, preds_train_inv)),
+                    "Test RMSE": np.sqrt(mean_squared_error(y_true_test, preds_test_inv))
+                })
 
-        # --- SHAP for RF ---
-        st.subheader(" SHAP Feature Importance (Random Forest)")
-        explainer = shap.Explainer(model_dict["Random Forest"] if use_saved else rf, X_train_scaled)
-        shap_values = explainer(X_test_scaled)
-        fig, ax = plt.subplots()
-        shap.plots.bar(shap_values, max_display=10, show=False, ax=ax)
-        st.pyplot(fig)
+            best_model = min(metrics, key=lambda x: x["Test MAPE"])
+            model_name = best_model["Model"]
+            best_mape = best_model["Test MAPE"]
+            best_rmse = best_model["Test RMSE"]
+
+            log_entry = pd.DataFrame([{
+                "RunDate": pd.Timestamp.today(),
+                "Currency": selected_currency.upper(),  # <- ensure uppercase
+                "Model": model_name,
+                "MAPE": best_mape,
+                "RMSE": best_rmse
+            }])
+            log_dir = "logs"
+            os.makedirs(log_dir, exist_ok=True)
+            log_path = f"{log_dir}/model_feedback_log.csv"
+            if os.path.exists(log_path):
+                existing = pd.read_csv(log_path)
+                full_log = pd.concat([existing, log_entry], ignore_index=True)
+            else:
+                full_log = log_entry
+            full_log.to_csv(log_path, index=False)
+            #st.write("DEBUG: Log Data for INR", full_log[full_log["Currency"] == selected_currency])
+
+            preds_inv = scaler.inverse_transform(model_outputs_test[model_name].reshape(-1, 1)).flatten()
+            mape_pct = best_mape / 100
+            upper_bound = preds_inv * (1 + mape_pct)
+            lower_bound = preds_inv * (1 - mape_pct)
+            flag_mask = (y_true_test > upper_bound) | (y_true_test < lower_bound)
+
+            fig.add_trace(go.Scatter(x=test_df.index, y=upper_bound, name="Dynamic Upper", line=dict(dash="dot", color="green")))
+            fig.add_trace(go.Scatter(x=test_df.index, y=lower_bound, name="Dynamic Lower", line=dict(dash="dot", color="green")))
+            fig.add_trace(go.Scatter(
+                x=test_df.index[flag_mask],
+                y=y_true_test[flag_mask],
+                mode="markers",
+                name="Flagged Deviations",
+                marker=dict(color="red", size=10, symbol="x")
+            ))
+
+            fig.update_layout(
+                title=f"{selected_currency}: Forecast vs Thresholds ({model_name})",
+                xaxis_title="Date",
+                yaxis_title="FX Rate"
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
 
-# --- Tab 4: Final Thresholds & Forecast Accuracy (Enhanced) ---
+# --- Tab 4: Final Thresholds & Forecast Accuracy ---
 with tab4:
     st.header("Final Thresholds & Forecast Accuracy")
 
-    # Statistical final threshold
-    df_summary["FinalThreshold"] = df_summary[["95th_Pct", "GARCH_Forecast", "EVT_Threshold"]].max(axis=1)
+    df_summary["FinalThreshold"] = df_summary[[
+         "95th_Pct", "GARCH_Forecast", "EVT_Threshold"
+    ]].max(axis=1)
 
-    # Load best RMSE models
     @st.cache_data
-    def load_best_rmse_summary():
+    def load_best_mape_summary():
         try:
-            log_df = pd.read_csv("model_feedback_log.csv")
+            log_df = pd.read_csv("logs/model_feedback_log.csv")
             log_df["Currency"] = log_df["Currency"].str.strip().str.upper()
-            log_df = log_df.dropna(subset=["RMSE"])
-            best_model = log_df.sort_values("RMSE").drop_duplicates(subset=["Currency"])
-            return best_model.rename(columns={"RMSE": "Best_RMSE"})[["Currency", "Model", "Best_RMSE"]]
+            df_summary["Currency"] = df_summary["Currency"].str.strip().str.upper()
+            latest = log_df.sort_values("RunDate", ascending=False).drop_duplicates("Currency")
+            return latest[["Currency", "Model", "MAPE", "RMSE"]].rename(
+                columns={"MAPE": "Best_MAPE", "RMSE": "Best_RMSE"})
         except Exception as e:
-            st.error(f"Error loading RMSE summary: {e}")
-            return pd.DataFrame(columns=["Currency", "Model", "Best_RMSE"])
+            st.error(f"Error loading model summary: {e}")
+            return pd.DataFrame(columns=["Currency", "Best_MAPE", "Model", "Best_RMSE"])
 
-    selected_currency = st.selectbox("Select Currency", df["Currency"].unique(), index=None, key="tab4_currency")
+
+
+    selected_currency = st.selectbox("Select Currency", df["Currency"].unique(),index=None,key="tab4_currency")
     if selected_currency:
-        df_final = df_summary.merge(load_best_rmse_summary(), on="Currency", how="left")
+        best_mape_df = load_best_mape_summary()
+        df_final = df_summary.merge(best_mape_df, on="Currency", how="left", validate="one_to_one")
+        selected_currency = selected_currency.upper()
         row = df_final[df_final["Currency"] == selected_currency].iloc[0]
 
-        st.subheader(f"{selected_currency}: Thresholds & Model Summary")
+        st.subheader(f"{selected_currency}: Thresholds & Justification")
         st.markdown(f"""
-        - **Avg Log-Return Volatility** (Dynamic): `{round(row['AvgVol'], 4)}`
-        - **Avg OHLC Realized Volatility** (Manual): `{round(row['AvgRealizedVol'], 4)}`
-        - **Manual Threshold**: `{round(row['ManualThreshold'], 4)}`
-        - **Final Dynamic Threshold** (Statistical): `{round(row['FinalThreshold'], 4)}`
-        - **Best Forecasting Model**: `{row['Model'] if pd.notnull(row['Model']) else 'NA'}`
-        - **Best Model RMSE**: `{round(row['Best_RMSE'], 4) if pd.notnull(row['Best_RMSE']) else 'NA'}`
+        - **Avg Log-Return Volatility** (Dynamic): `{round(row['AvgVol'], 4)}`  
+        - **Avg OHLC Realized Volatility** (Manual): `{round(row['AvgRealizedVol'], 4)}`  
+        - **Manual Threshold**: `{round(row['ManualThreshold'], 4)}`  
+        - **Final Dynamic Threshold**: `{round(row['FinalThreshold'], 4)}`  
+        - **Best Forecasting Model**: `{row['Model']}`  
+        - **MAPE**: `{round(row['Best_MAPE'], 2)}%`
         """)
 
-        #  New Enhanced Volatility Comparison Plot
-        st.markdown("###  Volatility Trends vs Thresholds")
-
+        # Load volatility and scale
         trend_df = df[df["Currency"] == selected_currency].copy().sort_values("Date")
+        y_actual = trend_df["Volatility"].values
         dates = trend_df["Date"]
 
+        # MAPE Soft Bands
+        mape_pct = row["Best_MAPE"] / 100 if pd.notnull(row["Best_MAPE"]) else 0.05
+        upper_band = y_actual * (1 + mape_pct)
+        lower_band = y_actual * (1 - mape_pct)
+        flag_mask = (y_actual > upper_band) | (y_actual < lower_band)
+
+        # Confidence Interval from residuals
+        model_dict, _ = load_models(selected_currency)
+        ci_upper, ci_lower, ci_dates = None, None, None
+        if model_dict and row["Model"] in model_dict:
+            try:
+                # Use Close price as proxy since Volatility is not target in training
+                series = trend_df["Close"].values.reshape(-1, 1)
+                scaled = MinMaxScaler().fit_transform(series)
+                X_seq, y_seq = create_sequences(scaled, window=ROLL_WINDOW)
+
+                if row["Model"] == "LSTM":
+                    preds = model_dict["LSTM"].predict(X_seq).ravel()
+                else:
+                    preds = model_dict[row["Model"]].predict(X_seq.reshape(X_seq.shape[0], -1))
+                residuals = y_seq - preds
+                resid_std = np.std(residuals)
+                ci_upper = preds + 1.96 * resid_std
+                ci_lower = preds - 1.96 * resid_std
+                ci_dates = trend_df["Date"].iloc[-len(preds):]
+            except Exception as e:
+                st.warning("Confidence interval error: " + str(e))
+
+        # Plot
         fig_vol = go.Figure()
-        fig_vol.add_trace(go.Scatter(x=dates, y=trend_df["RealizedVol"], name="OHLC Realized Vol (Manual)", line=dict(color="orange")))
-        fig_vol.add_trace(go.Scatter(x=dates, y=trend_df["Volatility"], name="Log-Return Volatility (Dynamic)", line=dict(color="white")))
+        fig_vol.add_trace(go.Scatter(x=dates, y=y_actual, name="Actual Volatility", line=dict(color="white")))
+        fig_vol.add_trace(go.Scatter(x=dates, y=upper_band, name="MAPE Upper Band", line=dict(dash="dot", color="green")))
+        fig_vol.add_trace(go.Scatter(x=dates, y=lower_band, name="MAPE Lower Band", line=dict(dash="dot", color="green")))
 
-        fig_vol.add_hline(y=row["ManualThreshold"], line_color="orange", line_dash="dot", annotation_text="Manual Threshold", annotation_position="top left")
-        fig_vol.add_hline(y=row["FinalThreshold"], line_color="green", line_dash="dash", annotation_text="Statistical Threshold", annotation_position="top left")
+        if ci_upper is not None:
+            fig_vol.add_trace(go.Scatter(x=ci_dates, y=ci_upper, name="Stat Upper CI", line=dict(dash="dash", color="cyan")))
+            fig_vol.add_trace(go.Scatter(x=ci_dates, y=ci_lower, name="Stat Lower CI", line=dict(dash="dash", color="cyan")))
 
-        fig_vol.update_layout(title="Volatility Comparison: Realized vs Log-Return",
-                              xaxis_title="Date", yaxis_title="Volatility", height=450)
+        fig_vol.add_hline(y=row["ManualThreshold"], line_color="red", line_dash="dot", annotation_text="Manual")
+        fig_vol.add_hline(y=row["FinalThreshold"], line_color="orange", line_dash="dash", annotation_text="Final Dynamic")
+
+        fig_vol.add_trace(go.Scatter(
+            x=dates[flag_mask], y=y_actual[flag_mask],
+            mode="markers", name="Flagged Deviations",
+            marker=dict(color="red", size=8, symbol="x")
+        ))
+
+        fig_vol.update_layout(
+            title=f"{selected_currency}: Volatility vs Thresholds & Bands",
+            xaxis_title="Date", yaxis_title="Annualized Volatility"
+        )
         st.plotly_chart(fig_vol, use_container_width=True)
 
-        st.markdown("""
-        **Interpretation Tip:**  
-        - Manual thresholds use slower **realized OHLC volatility**.  
-        - Dynamic thresholds use faster **log-return volatility**, helping catch spikes sooner.  
-        - If realized breaches but log-return doesn't (or vice versa), it signals mismatch and latency in manual rules.
+        st.markdown(f"""
+        ### 📌 Interpretation Summary
+
+        #### 🔴 Manual Threshold
+        - Based on **OHLC Realized Volatility** (slow to react)
+        - Realized Vol = `{row['AvgRealizedVol']:.4f}`  
+        - Manual Threshold = `{row['ManualThreshold']:.4f}`
+
+        #### 🟠 Final Dynamic Threshold (Hard Limit)
+        - Based on GARCH, EVT, and 95th percentile
+        - Final = `{row['FinalThreshold']:.4f}`  
+        → **{"Higher" if row['FinalThreshold'] > row['ManualThreshold'] else "Lower"}** than manual → reflects real-time risk
+
+        #### 🟢 MAPE Bands (Soft)
+        - Based on model forecast error range: ±{round(mape_pct*100)}%
+        - Volatility × (1 ± MAPE)
+        - Helps identify deviations earlier
+
+        #### 🔵 Residual Confidence Interval
+        - Derived from actual model prediction error
+        - CI = forecast ± 1.96 × std(residuals)
+        - More robust, can guide confidence in alerts
+
+        ---
+        ✅ Use **Final Dynamic** for official breach thresholds  
+        ✅ Use **MAPE** & **Residual CI** for early alerts & model trust
         """)
 
-        # Threshold comparison bar chart
-        fig = go.Figure()
-        fig.add_trace(go.Bar(name="Manual", x=[selected_currency], y=[row["ManualThreshold"]]))
-        fig.add_trace(go.Bar(name="Statistical", x=[selected_currency], y=[row["FinalThreshold"]]))
-        if pd.notnull(row["Best_RMSE"]):
-            fig.add_trace(go.Bar(name="Best RMSE", x=[selected_currency], y=[row["Best_RMSE"]]))
-        fig.update_layout(title="Threshold & Model Comparison", barmode="group")
-        st.plotly_chart(fig, use_container_width=True)
 
-        # Global Threshold Table
-        st.subheader(" Cross-Currency Threshold Overview")
-        st.dataframe(row[[
-            "Currency", "ManualThreshold", "FinalThreshold", "Model", "Best_RMSE"
-        ]], use_container_width=True)
-
-        st.download_button(" Download Final Summary", df_final.to_csv(index=False),
-                           file_name="final_thresholds_summary.csv")
 with tab5:
-    st.header(" Cross-Currency Thresholds (Synthetic FX)")
+    st.header("Cross-Currency Thresholds (Synthetic FX)")
 
     st.markdown("""
-    This module estimates thresholds for cross-currency pairs based on synthetic construction.  
-    - **Synthetic Rate**: `BaseUSD / QuoteUSD`  
-    - **Volatility Measures**:  
-      - Manual = average realized volatility (OHLC-based)  
-      - Dynamic = log-return rolling volatility  
-    - **Thresholds**:  
-      - Manual = max(manual thresholds of base & quote legs)  
-      - Dynamic = 95th percentile of synthetic volatility  
+    Synthetic FX pairs are constructed by combining two USD-based currencies:  
+    `Base / Quote = (BaseUSD) / (QuoteUSD)`  
+
+    We compare 3 key thresholds:  
+    -  Manual Threshold (from OHLC avg volatility)  
+    -  Dynamic Threshold (95th percentile of synthetic volatility)  
+    -  Model Confidence Bands (statistical residuals from linear model)
     """)
 
     currencies = df["Currency"].unique().tolist()
     cross_pairs = [(f"{b}{q}", b, q) for b in currencies for q in currencies if b != q]
-    pair_labels = [f"{p[0]} = {p[1]}USD × USD{p[2]}" for p in cross_pairs]
-    pair_choice = st.selectbox("Select Cross Pair", pair_labels,index=None)
+    pair_labels = [f"{p[0]} = {p[1]}USD ÷ {p[2]}USD" for p in cross_pairs]
+    pair_choice = st.selectbox("Select Cross Pair", pair_labels, index=None)
+
     if pair_choice:
-        selected_pair = cross_pairs[pair_labels.index(pair_choice)]
-        pair_name, base_ccy, quote_ccy = selected_pair
+        pair_name, base_ccy, quote_ccy = cross_pairs[pair_labels.index(pair_choice)]
 
         try:
             base_df = df[df["Currency"] == base_ccy][["Date", "Close"]].copy()
@@ -633,63 +666,90 @@ with tab5:
             merged = pd.merge(base_df, quote_df, on="Date", suffixes=(f"_{base_ccy}", f"_{quote_ccy}")).dropna()
             merged["SyntheticRate"] = merged[f"Close_{base_ccy}"] / merged[f"Close_{quote_ccy}"]
             merged["LogReturn"] = np.log(merged["SyntheticRate"]).diff()
-
             merged["CrossVolatility"] = merged["LogReturn"].rolling(ROLL_WINDOW).std() * ANNUALIZE
-            merged["ManualVolatility"] = merged["SyntheticRate"].rolling(ROLL_WINDOW).std() / np.sqrt(252)
+
+            # Manual-style volatility via synthetic OHLC
+            merged["Synthetic_High"] = merged[[f"Close_{base_ccy}", f"Close_{quote_ccy}"]].max(axis=1)
+            merged["Synthetic_Low"] = merged[[f"Close_{base_ccy}", f"Close_{quote_ccy}"]].min(axis=1)
+            merged["OHLCVolatility"] = (merged["Synthetic_High"] - merged["Synthetic_Low"]) / merged["SyntheticRate"]
+            merged["ManualVolatility"] = merged["OHLCVolatility"].rolling(ROLL_WINDOW).mean() / np.sqrt(252)
+
             merged.dropna(inplace=True)
 
-            # Pull leg-level manual thresholds
             df_thresh = df_summary.set_index("Currency")
             base_thresh = df_thresh.loc[base_ccy, "ManualThreshold"]
             quote_thresh = df_thresh.loc[quote_ccy, "ManualThreshold"]
             manual_cross = max(base_thresh, quote_thresh)
             dynamic_cross = merged["CrossVolatility"].quantile(PCT_THRESHOLD)
 
-            # Breach flags
             merged["Breach_Manual"] = merged["CrossVolatility"] > manual_cross
             merged["Breach_Dynamic"] = merged["CrossVolatility"] > dynamic_cross
 
-            # Compute vol stats
+            # Residual-based CI (Linear Regression fit)
+            from sklearn.linear_model import LinearRegression
+            vol_series = merged["CrossVolatility"].values.reshape(-1, 1)
+            X_seq, y_seq = create_sequences(vol_series, window=ROLL_WINDOW)
+            model = LinearRegression().fit(X_seq.reshape(X_seq.shape[0], -1), y_seq)
+            preds = model.predict(X_seq.reshape(X_seq.shape[0], -1))
+            residuals = y_seq - preds
+            resid_std = np.std(residuals)
+            ci_upper = preds + 1.96 * resid_std
+            ci_lower = preds - 1.96 * resid_std
+            ci_dates = merged["Date"].iloc[-len(preds):]
+
+            # Summary metrics
             manual_vol_avg = merged["ManualVolatility"].mean()
             dynamic_vol_avg = merged["CrossVolatility"].mean()
 
-            #  Threshold + volatility summary
             st.subheader(f"🔍 {pair_name} Threshold & Volatility Summary")
             st.markdown(f"""
-            - **Base Currency** `{base_ccy}` Manual Threshold: `{base_thresh:.4f}`  
-            - **Quote Currency** `{quote_ccy}` Manual Threshold: `{quote_thresh:.4f}`  
-            - **→ Manual Cross Threshold**: `{manual_cross:.4f}`  
-            - **→ Dynamic Threshold** (95th pct): `{dynamic_cross:.4f}`  
-
-            ---
-            - **Avg Manual Volatility** (Synthetic Rate std / √252): `{manual_vol_avg:.4f}`  
-            - **Avg Dynamic Volatility** (Rolling log-return std): `{dynamic_vol_avg:.4f}`
+            - **Base `{base_ccy}` Manual Threshold**: `{base_thresh:.4f}`  
+            - **Quote `{quote_ccy}` Manual Threshold**: `{quote_thresh:.4f}`  
+            - **Manual Cross Threshold** (max of both): `{manual_cross:.4f}`  
+            - **Dynamic Threshold** (95th percentile): `{dynamic_cross:.4f}`  
+            - **Avg Realized (Manual)**: `{manual_vol_avg:.4f}`  
+            - **Avg Log-Return (Dynamic)**: `{dynamic_vol_avg:.4f}`
             """)
 
-            #  Volatility chart
-            fig = px.line(merged, x="Date", y="CrossVolatility", title=f"{pair_name} Synthetic Volatility vs Thresholds")
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=merged["Date"], y=merged["CrossVolatility"], name="Synthetic Volatility", line=dict(color="white")))
             fig.add_hline(y=manual_cross, line_color="red", line_dash="dot", annotation_text="Manual Threshold")
-            fig.add_hline(y=dynamic_cross, line_color="green", line_dash="dash", annotation_text="Dynamic Threshold")
+            fig.add_hline(y=dynamic_cross, line_color="orange", line_dash="dash", annotation_text="Dynamic Threshold")
 
-            fig.add_trace(go.Scatter(
-                x=merged[merged["Breach_Dynamic"]]["Date"],
-                y=merged[merged["Breach_Dynamic"]]["CrossVolatility"],
-                mode="markers", name="Breach (Dynamic)", marker=dict(color="orange", size=8, symbol="x")
-            ))
+            fig.add_trace(go.Scatter(x=ci_dates, y=ci_upper, name="Stat Upper CI", line=dict(dash="dot", color="cyan")))
+            fig.add_trace(go.Scatter(x=ci_dates, y=ci_lower, name="Stat Lower CI", line=dict(dash="dot", color="cyan")))
 
             fig.add_trace(go.Scatter(
                 x=merged[merged["Breach_Manual"]]["Date"],
                 y=merged[merged["Breach_Manual"]]["CrossVolatility"],
-                mode="markers", name="Breach (Manual)", marker=dict(color="red", size=7, symbol="circle")
+                mode="markers", name="Manual Breach", marker=dict(color="red", symbol="circle", size=7)
             ))
 
+            fig.add_trace(go.Scatter(
+                x=merged[merged["Breach_Dynamic"]]["Date"],
+                y=merged[merged["Breach_Dynamic"]]["CrossVolatility"],
+                mode="markers", name="Dynamic Breach", marker=dict(color="orange", symbol="x", size=8)
+            ))
+
+            fig.update_layout(
+                title=f"{pair_name}: Synthetic Volatility with Thresholds & Confidence Bands",
+                xaxis_title="Date", yaxis_title="Annualized Volatility"
+            )
             st.plotly_chart(fig, use_container_width=True)
 
-            st.markdown("###  Last 30-Day Snapshot")
-            st.dataframe(
-                merged[["Date", "SyntheticRate", "CrossVolatility", "ManualVolatility", "Breach_Manual", "Breach_Dynamic"]].tail(30),
-                use_container_width=True
-            )
+            st.markdown("### 🧾 Interpretation Summary")
+            st.markdown(f"""
+            - 🔴 **Manual Threshold** is derived from OHLC-style volatility, slow to react.  
+            - 🟠 **Dynamic Threshold** captures spikes in synthetic volatility.  
+            - 🔵 **Confidence Intervals** built from statistical model offer trust-based monitoring zone.  
+            - ❌ Markers show real breaches in manual/dynamic logic.
+
+             Use **Dynamic Threshold** for hard breaches.  
+             Use **Statistical Bands** as early warning for cross-pair deviations.
+            """)
+
+            st.markdown("### Last 30-Day Vol Snapshot")
+            st.dataframe(merged[["Date", "SyntheticRate", "CrossVolatility", "ManualVolatility", "Breach_Manual", "Breach_Dynamic"]].tail(30), use_container_width=True)
 
         except Exception as e:
-            st.error(f"Failed to compute synthetic cross pair volatility: {e}")
+            st.error(f"Failed to compute cross-pair stats: {e}")
