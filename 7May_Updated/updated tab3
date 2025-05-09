@@ -1,0 +1,96 @@
+# --- TAB 3: Live FX Forecasting (Flexible Test Period + Logging) ---
+with tab3:
+    st.header("Live FX Forecasting (Flexible Test Period)")
+
+    selected_currency = st.selectbox("Select Currency", df["Currency"].unique(), key="tab3_currency")
+    test_days = st.slider("Test Period (days before latest)", 30, 90, 60)
+
+    if selected_currency:
+        df_cur = df[df["Currency"] == selected_currency][["Date", "Close"]].dropna()
+        df_cur["Date"] = pd.to_datetime(df_cur["Date"])
+        df_cur.set_index("Date", inplace=True)
+
+        latest = df_cur.index.max()
+        test_start = latest - pd.Timedelta(days=test_days)
+        train_df = df_cur[df_cur.index < test_start]
+        test_df = df_cur[df_cur.index >= test_start]
+
+        if len(train_df) < 40 or len(test_df) < 5:
+            st.warning("Not enough data for selected test period.")
+        else:
+            scaler = MinMaxScaler()
+            scaled_full = scaler.fit_transform(df_cur)
+            scaled_train = scaler.transform(train_df)
+            scaled_test = scaler.transform(test_df)
+
+            def create_seq(data, window):
+                X, y = [], []
+                for i in range(len(data) - window):
+                    X.append(data[i:i+window])
+                    y.append(data[i+window])
+                return np.array(X), np.array(y)
+
+            window = 30
+            X_train, y_train = create_seq(scaled_train, window)
+            X_test = [scaled_full[i-window:i] for i in range(len(scaled_full)-len(scaled_test), len(scaled_full))]
+            X_test = np.array(X_test)
+
+            X_train_rf = X_train.reshape(X_train.shape[0], -1)
+            X_test_rf = X_test.reshape(X_test.shape[0], -1)
+            X_train_lstm = X_train.reshape(X_train.shape[0], window, 1)
+            X_test_lstm = X_test.reshape(X_test.shape[0], window, 1)
+
+            # Models
+            rf = RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42)
+            rf.fit(X_train_rf, y_train.ravel())
+            rf_preds = rf.predict(X_test_rf)
+
+            lstm = Sequential()
+            lstm.add(LSTM(64, input_shape=(window, 1)))
+            lstm.add(Dropout(0.2))
+            lstm.add(Dense(1))
+            lstm.compile(loss='mse', optimizer='adam')
+            lstm.fit(X_train_lstm, y_train, epochs=20, batch_size=16, verbose=0)
+            lstm_preds = lstm.predict(X_test_lstm).ravel()
+
+            lr = LinearRegression()
+            lr.fit(X_train_rf, y_train)
+            lr_preds = lr.predict(X_test_rf)
+
+            model_results = {
+                "Random Forest": rf_preds,
+                "LSTM": lstm_preds,
+                "Linear Regression": lr_preds
+            }
+
+            actual_test = scaler.inverse_transform(scaled_test).flatten()
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=test_df.index, y=actual_test, name="Actual", line=dict(color="white")))
+
+            metrics = []
+            for model, pred in model_results.items():
+                pred_inv = scaler.inverse_transform(pred.reshape(-1, 1)).flatten()
+                fig.add_trace(go.Scatter(x=test_df.index, y=pred_inv, name=model))
+                metrics.append({
+                    "Model": model,
+                    "MAPE": mean_absolute_percentage_error(actual_test, pred_inv) * 100,
+                    "RMSE": np.sqrt(mean_squared_error(actual_test, pred_inv))
+                })
+
+            best_model = min(metrics, key=lambda x: x["MAPE"])
+            log_df = pd.DataFrame([{
+                "RunDate": pd.Timestamp.today(),
+                "Currency": selected_currency,
+                "Model": best_model["Model"],
+                "MAPE": best_model["MAPE"],
+                "RMSE": best_model["RMSE"]
+            }])
+            os.makedirs("logs", exist_ok=True)
+            log_path = "logs/model_feedback_log.csv"
+            if os.path.exists(log_path):
+                existing = pd.read_csv(log_path)
+                log_df = pd.concat([existing, log_df], ignore_index=True)
+            log_df.to_csv(log_path, index=False)
+
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(pd.DataFrame(metrics).round(4), use_container_width=True)
