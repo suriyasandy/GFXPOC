@@ -1,0 +1,110 @@
+with tab5:
+    st.header("Cross-Currency Thresholds (Synthetic FX)")
+
+    st.markdown("""
+    Synthetic FX pairs are constructed by combining two USD-based currencies:  
+    `Base / Quote = (BaseUSD) / (QuoteUSD)`  
+
+    Thresholds shown below reflect the **selected rolling window** (`ROLL_WINDOW = {}` days).  
+    """.format(ROLL_WINDOW))
+
+    currencies = df["Currency"].unique().tolist()
+    cross_pairs = [(f"{b}{q}", b, q) for b in currencies for q in currencies if b != q]
+    pair_labels = [f"{p[0]} = {p[1]}USD ÷ {p[2]}USD" for p in cross_pairs]
+    pair_choice = st.selectbox("Select Cross Pair", pair_labels, index=None)
+
+    if pair_choice:
+        pair_name, base_ccy, quote_ccy = cross_pairs[pair_labels.index(pair_choice)]
+
+        try:
+            base_df = df[df["Currency"] == base_ccy][["Date", "Close"]].copy()
+            quote_df = df[df["Currency"] == quote_ccy][["Date", "Close"]].copy()
+
+            merged = pd.merge(base_df, quote_df, on="Date", suffixes=(f"_{base_ccy}", f"_{quote_ccy}")).dropna()
+            merged["SyntheticRate"] = merged[f"Close_{base_ccy}"] / merged[f"Close_{quote_ccy}"]
+            merged["LogReturn"] = np.log(merged["SyntheticRate"]).diff()
+            merged["CrossVolatility"] = merged["LogReturn"].rolling(ROLL_WINDOW).std() * ANNUALIZE
+
+            # Manual-style volatility via synthetic OHLC
+            merged["Synthetic_High"] = merged[[f"Close_{base_ccy}", f"Close_{quote_ccy}"]].max(axis=1)
+            merged["Synthetic_Low"] = merged[[f"Close_{base_ccy}", f"Close_{quote_ccy}"]].min(axis=1)
+            merged["OHLCVolatility"] = (merged["Synthetic_High"] - merged["Synthetic_Low"]) / merged["SyntheticRate"]
+            merged["ManualVolatility"] = merged["OHLCVolatility"].rolling(ROLL_WINDOW).mean() / np.sqrt(252)
+
+            merged.dropna(inplace=True)
+
+            # Only compute thresholds based on selected window slice
+            recent_window = merged.tail(ROLL_WINDOW).copy()
+
+            df_thresh = df_summary.set_index("Currency")
+            base_thresh = df_thresh.loc[base_ccy, "ManualThreshold"]
+            quote_thresh = df_thresh.loc[quote_ccy, "ManualThreshold"]
+            manual_cross = max(base_thresh, quote_thresh)
+            dynamic_cross = recent_window["CrossVolatility"].quantile(PCT_THRESHOLD)
+
+            recent_window["Breach_Manual"] = recent_window["CrossVolatility"] > manual_cross
+            recent_window["Breach_Dynamic"] = recent_window["CrossVolatility"] > dynamic_cross
+
+            # Residual-based CI (Linear Regression fit)
+            from sklearn.linear_model import LinearRegression
+            vol_series = recent_window["CrossVolatility"].values.reshape(-1, 1)
+            X_seq, y_seq = create_sequences(vol_series, window=ROLL_WINDOW)
+            model = LinearRegression().fit(X_seq.reshape(X_seq.shape[0], -1), y_seq)
+            preds = model.predict(X_seq.reshape(X_seq.shape[0], -1))
+            residuals = y_seq - preds
+            resid_std = np.std(residuals)
+            ci_upper = preds + 1.96 * resid_std
+            ci_lower = preds - 1.96 * resid_std
+            ci_dates = recent_window["Date"].iloc[-len(preds):]
+
+            # Summary metrics
+            manual_vol_avg = recent_window["ManualVolatility"].mean()
+            dynamic_vol_avg = recent_window["CrossVolatility"].mean()
+
+            st.subheader(f"🔍 {pair_name} Threshold Summary (Rolling {ROLL_WINDOW}D)")
+            st.markdown(f"""
+            - **Base `{base_ccy}` Manual Threshold**: `{base_thresh:.4f}`  
+            - **Quote `{quote_ccy}` Manual Threshold**: `{quote_thresh:.4f}`  
+            - **Manual Cross Threshold** (max of both): `{manual_cross:.4f}`  
+            - **Dynamic Threshold** (95th percentile over window): `{dynamic_cross:.4f}`  
+            - **Avg Realized (Manual)**: `{manual_vol_avg:.4f}`  
+            - **Avg Log-Return (Dynamic)**: `{dynamic_vol_avg:.4f}`
+            """)
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=recent_window["Date"], y=recent_window["CrossVolatility"],
+                                     name="Synthetic Volatility", line=dict(color="white")))
+            fig.add_hline(y=manual_cross, line_color="red", line_dash="dot", annotation_text="Manual Threshold")
+            fig.add_hline(y=dynamic_cross, line_color="orange", line_dash="dash", annotation_text="Dynamic Threshold")
+
+            fig.add_trace(go.Scatter(x=ci_dates, y=ci_upper, name="Stat Upper CI",
+                                     line=dict(dash="dot", color="cyan")))
+            fig.add_trace(go.Scatter(x=ci_dates, y=ci_lower, name="Stat Lower CI",
+                                     line=dict(dash="dot", color="cyan")))
+
+            fig.add_trace(go.Scatter(
+                x=recent_window[recent_window["Breach_Manual"]]["Date"],
+                y=recent_window[recent_window["Breach_Manual"]]["CrossVolatility"],
+                mode="markers", name="Manual Breach", marker=dict(color="red", symbol="circle", size=7)
+            ))
+
+            fig.add_trace(go.Scatter(
+                x=recent_window[recent_window["Breach_Dynamic"]]["Date"],
+                y=recent_window[recent_window["Breach_Dynamic"]]["CrossVolatility"],
+                mode="markers", name="Dynamic Breach", marker=dict(color="orange", symbol="x", size=8)
+            ))
+
+            fig.update_layout(
+                title=f"{pair_name}: Synthetic Volatility (Last {ROLL_WINDOW} Days)",
+                xaxis_title="Date", yaxis_title="Annualized Volatility"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("### Last Window Snapshot")
+            st.dataframe(recent_window[[
+                "Date", "SyntheticRate", "CrossVolatility", "ManualVolatility",
+                "Breach_Manual", "Breach_Dynamic"
+            ]].tail(30), use_container_width=True)
+
+        except Exception as e:
+            st.error(f"Failed to compute cross-pair stats: {e}")
