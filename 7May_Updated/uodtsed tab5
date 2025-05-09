@@ -1,0 +1,97 @@
+# --- Tab 5: Cross-Currency Thresholds (Synthetic FX) ---
+with tab5:
+    st.header("Cross-Currency Thresholds (Synthetic FX)")
+
+    st.markdown("""
+    This module simulates cross-currency volatility using **synthetic construction**:  
+    - Synthetic Rate = `BaseUSD / QuoteUSD`
+    - Manual Threshold = `max(Base Threshold, Quote Threshold)`  
+    - Dynamic Threshold = `95th percentile` of synthetic volatility (rolling std of log returns)
+    """)
+
+    currencies = df["Currency"].unique().tolist()
+    cross_pairs = [(f"{b}{q}", b, q) for b in currencies for q in currencies if b != q]
+    pair_labels = [f"{p[0]} = {p[1]}USD × USD{p[2]}" for p in cross_pairs]
+    pair_choice = st.selectbox("Select Cross Pair", pair_labels, index=None)
+
+    if pair_choice:
+        selected_pair = cross_pairs[pair_labels.index(pair_choice)]
+        pair_name, base_ccy, quote_ccy = selected_pair
+
+        try:
+            base_df = df[df["Currency"] == base_ccy][["Date", "Close"]].copy()
+            quote_df = df[df["Currency"] == quote_ccy][["Date", "Close"]].copy()
+            merged = pd.merge(base_df, quote_df, on="Date", suffixes=(f"_{base_ccy}", f"_{quote_ccy}")).dropna()
+
+            merged["SyntheticRate"] = merged[f"Close_{base_ccy}"] / merged[f"Close_{quote_ccy}"]
+            merged["LogReturn"] = np.log(merged["SyntheticRate"]).diff()
+            merged["CrossVolatility"] = merged["LogReturn"].rolling(ROLL_WINDOW).std() * ANNUALIZE
+
+            # OHLC-like manual volatility (Synthetic High/Low)
+            merged["High"] = merged[[f"Close_{base_ccy}", f"Close_{quote_ccy}"]].max(axis=1)
+            merged["Low"] = merged[[f"Close_{base_ccy}", f"Close_{quote_ccy}"]].min(axis=1)
+            merged["OHLCVolatility"] = (merged["High"] - merged["Low"]) / merged["SyntheticRate"]
+            merged["ManualVolatility"] = merged["OHLCVolatility"].rolling(ROLL_WINDOW).mean() / np.sqrt(252)
+
+            merged.dropna(inplace=True)
+
+            # Get leg-level thresholds
+            df_thresh = df_summary.set_index("Currency")
+            base_thresh = df_thresh.loc[base_ccy, "ManualThreshold"]
+            quote_thresh = df_thresh.loc[quote_ccy, "ManualThreshold"]
+            manual_cross = max(base_thresh, quote_thresh)
+            dynamic_cross = merged["CrossVolatility"].quantile(PCT_THRESHOLD)
+
+            # Flag breaches
+            merged["Breach_Manual"] = merged["CrossVolatility"] > manual_cross
+            merged["Breach_Dynamic"] = merged["CrossVolatility"] > dynamic_cross
+
+            manual_vol_avg = merged["ManualVolatility"].mean()
+            dynamic_vol_avg = merged["CrossVolatility"].mean()
+
+            # Summary
+            st.subheader(f"🔍 {pair_name} Threshold Summary")
+            st.markdown(f"""
+            - **Base ({base_ccy}) Threshold**: `{base_thresh:.4f}`  
+            - **Quote ({quote_ccy}) Threshold**: `{quote_thresh:.4f}`  
+            - **Manual Cross Threshold**: `{manual_cross:.4f}`  
+            - **Dynamic Threshold (95th percentile)**: `{dynamic_cross:.4f}`  
+            - **Avg Manual Volatility (Synthetic)**: `{manual_vol_avg:.4f}`  
+            - **Avg Dynamic Volatility (Synthetic)**: `{dynamic_vol_avg:.4f}`
+            """)
+
+            # Plot
+            fig = px.line(merged, x="Date", y="CrossVolatility", title=f"{pair_name}: Synthetic Volatility vs Thresholds")
+            fig.add_hline(y=manual_cross, line_color="red", line_dash="dot", annotation_text="Manual Threshold")
+            fig.add_hline(y=dynamic_cross, line_color="green", line_dash="dash", annotation_text="Dynamic Threshold")
+
+            fig.add_trace(go.Scatter(
+                x=merged[merged["Breach_Dynamic"]]["Date"],
+                y=merged[merged["Breach_Dynamic"]]["CrossVolatility"],
+                mode="markers", name="Dynamic Breach", marker=dict(color="orange", symbol="x")
+            ))
+            fig.add_trace(go.Scatter(
+                x=merged[merged["Breach_Manual"]]["Date"],
+                y=merged[merged["Breach_Manual"]]["CrossVolatility"],
+                mode="markers", name="Manual Breach", marker=dict(color="red", symbol="circle")
+            ))
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("### 📊 Last 30-Day Snapshot")
+            st.dataframe(
+                merged[["Date", "SyntheticRate", "CrossVolatility", "ManualVolatility", "Breach_Manual", "Breach_Dynamic"]].tail(30),
+                use_container_width=True
+            )
+
+            st.markdown("""
+            ---
+            ### 🧠 Interpretation
+
+            - **Manual Threshold** is inherited from the more conservative leg (higher vol).
+            - **Dynamic Threshold** reflects actual realized volatility behavior of synthetic cross.
+            - When synthetic vol exceeds both, it strongly signals market abnormality in both legs.
+            - Use manual threshold as baseline, dynamic for stress events, and 30D view for short-term trend check.
+            """)
+
+        except Exception as e:
+            st.error(f"Failed to compute synthetic cross volatility: {e}")
