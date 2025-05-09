@@ -1,0 +1,80 @@
+with tab5:
+    st.header("Cross-Currency Thresholds (Synthetic FX)")
+
+    st.markdown("""
+    Synthetic FX pairs are constructed by combining two USD-based currencies:  
+    `Base / Quote = (BaseUSD) / (QuoteUSD)`  
+
+    We now show **rolling dynamic thresholds** (95th percentile)  
+    instead of flat lines, to reflect evolving market regimes.
+    """)
+
+    currencies = df["Currency"].unique().tolist()
+    cross_pairs = [(f"{b}{q}", b, q) for b in currencies for q in currencies if b != q]
+    pair_labels = [f"{p[0]} = {p[1]}USD ÷ {p[2]}USD" for p in cross_pairs]
+    pair_choice = st.selectbox("Select Cross Pair", pair_labels, index=None)
+
+    if pair_choice:
+        pair_name, base_ccy, quote_ccy = cross_pairs[pair_labels.index(pair_choice)]
+
+        try:
+            base_df = df[df["Currency"] == base_ccy][["Date", "Close"]].copy()
+            quote_df = df[df["Currency"] == quote_ccy][["Date", "Close"]].copy()
+
+            merged = pd.merge(base_df, quote_df, on="Date", suffixes=(f"_{base_ccy}", f"_{quote_ccy}")).dropna()
+            merged["SyntheticRate"] = merged[f"Close_{base_ccy}"] / merged[f"Close_{quote_ccy}"]
+            merged["LogReturn"] = np.log(merged["SyntheticRate"]).diff()
+            merged["CrossVolatility"] = merged["LogReturn"].rolling(ROLL_WINDOW).std() * ANNUALIZE
+
+            merged["Synthetic_High"] = merged[[f"Close_{base_ccy}", f"Close_{quote_ccy}"]].max(axis=1)
+            merged["Synthetic_Low"] = merged[[f"Close_{base_ccy}", f"Close_{quote_ccy}"]].min(axis=1)
+            merged["OHLCVolatility"] = (merged["Synthetic_High"] - merged["Synthetic_Low"]) / merged["SyntheticRate"]
+            merged["ManualVolatility"] = merged["OHLCVolatility"].rolling(ROLL_WINDOW).mean() / np.sqrt(252)
+
+            merged["RollingDynamicThreshold"] = (
+                merged["CrossVolatility"]
+                .rolling(ROLL_WINDOW)
+                .apply(lambda x: np.percentile(x, PCT_THRESHOLD * 100), raw=True)
+            )
+
+            merged.dropna(inplace=True)
+
+            df_thresh = df_summary.set_index("Currency")
+            base_thresh = df_thresh.loc[base_ccy, "ManualThreshold"]
+            quote_thresh = df_thresh.loc[quote_ccy, "ManualThreshold"]
+            manual_cross = max(base_thresh, quote_thresh)
+
+            merged["Breach_Manual"] = merged["CrossVolatility"] > manual_cross
+            merged["Breach_Dynamic"] = merged["CrossVolatility"] > merged["RollingDynamicThreshold"]
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=merged["Date"], y=merged["CrossVolatility"], name="Cross Volatility", line=dict(color="white")))
+            fig.add_trace(go.Scatter(x=merged["Date"], y=merged["RollingDynamicThreshold"], name="Rolling 95th Percentile", line=dict(color="orange", dash="dash")))
+            fig.add_hline(y=manual_cross, line_color="red", line_dash="dot", annotation_text="Manual Threshold")
+
+            fig.add_trace(go.Scatter(
+                x=merged[merged["Breach_Manual"]]["Date"],
+                y=merged[merged["Breach_Manual"]]["CrossVolatility"],
+                mode="markers", name="Manual Breach", marker=dict(color="red", symbol="circle", size=7)
+            ))
+
+            fig.add_trace(go.Scatter(
+                x=merged[merged["Breach_Dynamic"]]["Date"],
+                y=merged[merged["Breach_Dynamic"]]["CrossVolatility"],
+                mode="markers", name="Dynamic Breach", marker=dict(color="orange", symbol="x", size=8)
+            ))
+
+            fig.update_layout(
+                title=f"{pair_name}: Synthetic Volatility with Time-Varying Thresholds",
+                xaxis_title="Date", yaxis_title="Annualized Volatility"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("### Last 30-Day Snapshot")
+            st.dataframe(
+                merged[["Date", "SyntheticRate", "CrossVolatility", "ManualVolatility", "RollingDynamicThreshold", "Breach_Manual", "Breach_Dynamic"]].tail(30),
+                use_container_width=True
+            )
+
+        except Exception as e:
+            st.error(f"Failed to compute synthetic pair: {e}")
