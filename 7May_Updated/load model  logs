@@ -1,0 +1,258 @@
+# --- PART 1: Imports, Global Configs, and Utility Caching ---
+import streamlit as st
+import pandas as pd
+import numpy as np
+import os, joblib
+import plotly.express as px
+import plotly.graph_objects as go
+import matplotlib.pyplot as plt
+from arch import arch_model
+from scipy.stats import genpareto, kurtosis, skew
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error,root_mean_squared_error,mean_squared_error
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.svm import SVR
+import keras
+from datetime import datetime
+from keras.layers import Conv1D, MaxPooling1D, Flatten
+from keras.models import Sequential
+from keras.layers import LSTM, Dropout, Dense
+from keras.callbacks import EarlyStopping
+from keras.models import load_model
+from prophet import Prophet
+from statsmodels.tsa.stattools import adfuller
+import statsmodels.api as sm
+from xgboost import XGBRegressor
+import shap  
+
+ROLL_WINDOW = st.sidebar.slider("Rolling Window (Days)", 20, 120, 60,step=10)
+ANNUALIZE = np.sqrt(252)
+PCT_THRESHOLD = 0.95
+EVT_TAIL_PCT = 0.995
+
+# Page config
+st.set_page_config(page_title="FX Volatility App", layout="wide")
+
+# Background CSS
+st.markdown("""
+<style>
+.stApp { background-color: light-gray; }
+</style>
+""", unsafe_allow_html=True)
+
+# --- FX Data Loader ---
+@st.cache_data
+def load_fx_data(roll_window):
+    df = pd.read_csv("reuters_fx_data.csv")
+    df["Date"] = pd.to_datetime(df["Date"])
+    df.sort_values(["Currency", "Date"], inplace=True)
+    df["LogReturn"] = df.groupby("Currency")["Close"].transform(lambda x: np.log(x).diff())
+    df["Volatility"] = df.groupby("Currency")["LogReturn"].transform(lambda x: x.rolling(roll_window).std()) * ANNUALIZE
+    df["RealizedVol"] = df["OHLCVolatility"] / np.sqrt(252)
+    return df.dropna()
+
+# --- Sequence Creator for ML Models ---
+def create_sequences(data, window):
+    X, y = [], []
+    if isinstance(data, pd.Series):
+        data = data.dropna().values
+    else:
+        data = data[~np.isnan(data).any(axis=1)]
+    for i in range(len(data) - window):
+        X.append(data[i:i+window])
+        y.append(data[i+window])
+    return np.array(X), np.array(y)
+
+
+# --- Model Loader ---
+def load_models(currency_name, roll_window, path="models"):
+    try:
+        model_suffix = f"{currency_name}_{roll_window}"
+        rf = joblib.load(f"{path}/rf_{model_suffix}.pkl")
+        svr = joblib.load(f"{path}/svr_{model_suffix}.pkl")
+        lr = joblib.load(f"{path}/lr_{model_suffix}.pkl")
+        lstm = load_model(f"{path}/lstm_{model_suffix}.h5", compile=False)
+        scaler = joblib.load(f"{path}/scaler_{model_suffix}.pkl")
+        return {"Random Forest": rf, "SVR": svr, "Linear Regression": lr, "LSTM": lstm}, scaler
+    except Exception as e:
+        st.warning(f"Model loading failed for {currency_name} with window {roll_window}: {e}")
+        return None, None
+
+# --- Model Training and Saving ---
+def train_and_save_models(currency_name, df, save_path="models", window=ROLL_WINDOW):
+    os.makedirs(save_path, exist_ok=True)
+    df_currency = df[df["Currency"] == currency_name][["Date", "Close"]].dropna().copy()
+    df_currency["Date"] = pd.to_datetime(df_currency["Date"])
+    df_currency.set_index("Date", inplace=True)
+
+    scaler = MinMaxScaler()
+    scaled_data = scaler.fit_transform(df_currency)
+
+    X, y = create_sequences(scaled_data, window)
+    X_rf = X.reshape(X.shape[0], -1)
+    X_lstm = X.reshape(X.shape[0], X.shape[1], 1)
+    y = y.ravel()
+
+    model_suffix = f"{currency_name}_{window}"
+
+    rf_params = {"n_estimators": [50, 100], "max_depth": [5, 10, None]}
+    rf = GridSearchCV(RandomForestRegressor(random_state=42), rf_params, cv=TimeSeriesSplit(n_splits=3))
+    rf.fit(X_rf, y)
+    joblib.dump(rf.best_estimator_, f"{save_path}/rf_{model_suffix}.pkl")
+
+    svr_params = {"C": [1, 10], "gamma": ["scale", "auto"], "epsilon": [0.01, 0.1]}
+    svr = GridSearchCV(SVR(), svr_params, cv=TimeSeriesSplit(n_splits=3))
+    svr.fit(X_rf, y)
+    joblib.dump(svr.best_estimator_, f"{save_path}/svr_{model_suffix}.pkl")
+
+    lr = LinearRegression()
+    lr.fit(X_rf, y)
+    joblib.dump(lr, f"{save_path}/lr_{model_suffix}.pkl")
+
+    lstm = Sequential()
+    lstm.add(LSTM(64, input_shape=(X_lstm.shape[1], X_lstm.shape[2])))
+    lstm.add(Dropout(0.2))
+    lstm.add(Dense(1))
+    lstm.compile(loss='mse', optimizer='adam')
+
+    early_stop = EarlyStopping(monitor='loss', patience=3, restore_best_weights=True)
+    lstm.fit(X_lstm, y, epochs=20, batch_size=16, verbose=0, callbacks=[early_stop])
+    lstm.save(f"{save_path}/lstm_{model_suffix}.h5")
+
+    joblib.dump(scaler, f"{save_path}/scaler_{model_suffix}.pkl")
+    return True
+
+# --- Tab 3: Forecast with Dynamic Test Period ---
+with tab3:
+    st.header("Live FX Forecasting (Flexible Test Period)")
+
+    selected_currency = st.selectbox("Select Currency", df["Currency"].unique(), index=None, key="fx_forecast_currency")
+    test_days = st.slider("Select Test Period (days before latest date)", min_value=30, max_value=90, step=30, value=60)
+
+    if selected_currency:
+        df_ccy = df[df["Currency"] == selected_currency][["Date", "Close"]].dropna().copy()
+        df_ccy["Date"] = pd.to_datetime(df_ccy["Date"])
+        df_ccy.set_index("Date", inplace=True)
+
+        latest_date = df_ccy.index.max()
+        test_start = latest_date - pd.Timedelta(days=test_days)
+        train_df = df_ccy[df_ccy.index < test_start]
+        test_df = df_ccy[df_ccy.index >= test_start]
+
+        if train_df.empty or test_df.empty:
+            st.error("Not enough data for selected test period.")
+        else:
+            scaler = MinMaxScaler()
+            scaled_all = scaler.fit_transform(df_ccy)
+            scaled_train = scaler.transform(train_df)
+            scaled_test = scaler.transform(test_df)
+
+            def create_sequences(data, window):
+                X, y = [], []
+                for i in range(len(data) - window):
+                    X.append(data[i:i+window])
+                    y.append(data[i+window])
+                return np.array(X), np.array(y)
+
+            WINDOW = 30
+            X_train, y_train = create_sequences(scaled_train, WINDOW)
+            X_rf_test = []
+            for i in range(len(test_df)):
+                X_rf_test.append(scaled_all[-(len(test_df) + WINDOW - i):-len(test_df) + i])
+            X_rf_test = np.array(X_rf_test).reshape(len(X_rf_test), -1)
+            X_train_rf = X_train.reshape(X_train.shape[0], -1)
+            X_train_lstm = X_train.reshape(X_train.shape[0], X_train.shape[1], 1)
+            X_lstm_test = np.array([x.reshape(WINDOW, 1) for x in X_rf_test])
+
+            model_path_suffix = f"_w{ROLL_WINDOW}"
+            model_outputs_train, model_outputs_test = {}, {}
+
+            rf = RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42)
+            rf.fit(X_train_rf, y_train.ravel())
+            model_outputs_train["Random Forest"] = rf.predict(X_train_rf)
+            model_outputs_test["Random Forest"] = rf.predict(X_rf_test)
+
+            lstm = Sequential()
+            lstm.add(LSTM(64, input_shape=(WINDOW, 1)))
+            lstm.add(Dropout(0.2))
+            lstm.add(Dense(1))
+            lstm.compile(optimizer="adam", loss="mse")
+            lstm.fit(X_train_lstm, y_train, epochs=20, batch_size=16, verbose=0)
+            model_outputs_train["LSTM"] = lstm.predict(X_train_lstm).ravel()
+            model_outputs_test["LSTM"] = lstm.predict(X_lstm_test).ravel()
+
+            lr = LinearRegression()
+            lr.fit(X_train_rf, y_train)
+            model_outputs_train["Linear Regression"] = lr.predict(X_train_rf)
+            model_outputs_test["Linear Regression"] = lr.predict(X_rf_test)
+
+            y_true_train = scaler.inverse_transform(y_train.reshape(-1, 1)).flatten()
+            y_true_test = test_df["Close"].values
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=train_df.index[-len(y_true_train):], y=y_true_train, name="Actual (Train)", line=dict(color="white")))
+            fig.add_trace(go.Scatter(x=test_df.index, y=y_true_test, name="Actual (Test)", line=dict(color="white", dash="dot")))
+
+            metrics = []
+            for model, preds_train in model_outputs_train.items():
+                preds_train_inv = scaler.inverse_transform(preds_train.reshape(-1, 1)).flatten()
+                preds_test_inv = scaler.inverse_transform(model_outputs_test[model].reshape(-1, 1)).flatten()
+
+                fig.add_trace(go.Scatter(x=train_df.index[-len(y_true_train):], y=preds_train_inv, name=f"{model} (Train)", line=dict(dash="dash")))
+                fig.add_trace(go.Scatter(x=test_df.index, y=preds_test_inv, name=f"{model} (Test)", line=dict(dash="solid")))
+
+                metrics.append({
+                    "Model": model,
+                    "Train MAPE": mean_absolute_percentage_error(y_true_train, preds_train_inv) * 100,
+                    "Test MAPE": mean_absolute_percentage_error(y_true_test, preds_test_inv) * 100,
+                    "Train RMSE": np.sqrt(mean_squared_error(y_true_train, preds_train_inv)),
+                    "Test RMSE": np.sqrt(mean_squared_error(y_true_test, preds_test_inv))
+                })
+
+            best_model = min(metrics, key=lambda x: x["Test MAPE"])
+            model_name = best_model["Model"]
+            best_mape = best_model["Test MAPE"]
+            best_rmse = best_model["Test RMSE"]
+
+            log_entry = pd.DataFrame([{ 
+                "RunDate": pd.Timestamp.today(),
+                "Currency": selected_currency.upper(),
+                "Model": model_name,
+                "MAPE": best_mape,
+                "RMSE": best_rmse,
+                "RollWindow": ROLL_WINDOW
+            }])
+            log_dir = "logs"
+            os.makedirs(log_dir, exist_ok=True)
+            log_path = f"{log_dir}/model_feedback_log.csv"
+            if os.path.exists(log_path):
+                existing = pd.read_csv(log_path)
+                full_log = pd.concat([existing, log_entry], ignore_index=True)
+            else:
+                full_log = log_entry
+            full_log.to_csv(log_path, index=False)
+
+            preds_inv = scaler.inverse_transform(model_outputs_test[model_name].reshape(-1, 1)).flatten()
+            mape_pct = best_mape / 100
+            upper_bound = preds_inv * (1 + mape_pct)
+            lower_bound = preds_inv * (1 - mape_pct)
+            flag_mask = (y_true_test > upper_bound) | (y_true_test < lower_bound)
+
+            fig.add_trace(go.Scatter(x=test_df.index, y=upper_bound, name="Dynamic Upper", line=dict(dash="dot", color="green")))
+            fig.add_trace(go.Scatter(x=test_df.index, y=lower_bound, name="Dynamic Lower", line=dict(dash="dot", color="green")))
+            fig.add_trace(go.Scatter(
+                x=test_df.index[flag_mask],
+                y=y_true_test[flag_mask],
+                mode="markers",
+                name="Flagged Deviations",
+                marker=dict(color="red", size=10, symbol="x")
+            ))
+
+            fig.update_layout(
+                title=f"{selected_currency}: Forecast vs Thresholds ({model_name})",
+                xaxis_title="Date",
+                yaxis_title="FX Rate"
+            )
+            st.plotly_chart(fig, use_container_width=True)
