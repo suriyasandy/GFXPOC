@@ -1,0 +1,6 @@
+FX Volatility Monitoring – PoC Status Update
+	1.	Threshold Framework: We’ve built a unified engine that compares manual thresholds with dynamic ones (GARCH, percentile, EVT) for each currency.
+	2.	Forecast Accuracy: Integrated models like LSTM and ARIMA-GARCH to predict FX trends with confidence bands and alert deviations.
+	3.	Cross-Currency Logic: Synthetic volatility for cross pairs (e.g., INRJPY) is now modeled and compared across dynamic, manual, and ML thresholds.
+	4.	Anomaly Detection: Statistical methods (Z-Score, CUSUM, Mahalanobis) and regime detection (HMM) flag unusual behavior effectively.
+	5.	Next Step: Ready for validation and feedback from the ops team to align with real-world exception scenarios.
